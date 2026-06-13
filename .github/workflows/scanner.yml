@@ -25,10 +25,25 @@ jobs:
       - name: Nainstalovat kniznice
         run: pip install yfinance requests pandas matplotlib
 
+      - name: Obnovit stav
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: scanner-state-${{ github.run_id }}
+          restore-keys: |
+            scanner-state-
+
       - name: Spustit skener
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           RUN_ONCE: "1"
         run: python market_scanner.py
-        
+
+      - name: Ulozit stav
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: scanner-state-${{ github.run_id }}

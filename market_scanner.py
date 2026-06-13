@@ -582,9 +582,55 @@ def fetch(ticker):
         return None
 
 
+def build_snapshot_item(name, closes, highs, lows, atr_val):
+    """Prehlad jedneho trhu pre dashboard."""
+    last = closes[-1]
+    r = rsi(closes, RSI_PERIOD)
+    rsi_v = r[-1] if r[-1] is not None else 50.0
+    ef = ema(closes, EMA_FAST); es = ema(closes, EMA_SLOW)
+    trend = "up" if ef[-1] >= es[-1] else "down"
+    atr_pct = (atr_val / last * 100.0) if (atr_val and last) else 0.0
+    ref = closes[-1 - RAPID_BARS] if len(closes) > RAPID_BARS else closes[0]
+    chg = ((last - ref) / ref * 100.0) if ref else 0.0
+    wh = max(highs[-1 - BREAKOUT_LOOKBACK:-1])
+    wl = min(lows[-1 - BREAKOUT_LOOKBACK:-1])
+    dist_high = ((last - wh) / wh * 100.0) if wh else 0.0
+    dist_low = ((last - wl) / wl * 100.0) if wl else 0.0
+    extreme = (rsi_v >= RSI_OVERBOUGHT or rsi_v <= RSI_OVERSOLD
+               or last > wh or last < wl or abs(chg) >= RAPID_PCT_MIN * 2)
+    moderate = (rsi_v >= 60 or rsi_v <= 40 or abs(chg) >= RAPID_PCT_MIN)
+    status = "green" if extreme else ("orange" if moderate else "gray")
+    return {"name": name, "price": round(last, 2), "rsi": round(rsi_v),
+            "trend": trend, "atr_pct": round(atr_pct, 2), "chg_pct": round(chg, 2),
+            "dist_high": round(dist_high, 2), "dist_low": round(dist_low, 2),
+            "status": status}
+
+
+def publish_dashboard(items):
+    """Zapise prehlad do verejneho Gistu (ak su nastavene GIST_TOKEN a GIST_ID)."""
+    token = os.environ.get("GIST_TOKEN", "")
+    gid = os.environ.get("GIST_ID", "")
+    if not (token and gid):
+        return
+    payload = {"updated": dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+               "items": items}
+    try:
+        r = requests.patch(
+            f"https://api.github.com/gists/{gid}",
+            headers={"Authorization": f"token {token}",
+                     "Accept": "application/vnd.github+json"},
+            json={"files": {"dashboard.json": {"content": json.dumps(payload, ensure_ascii=False)}}},
+            timeout=20)
+        if r.status_code not in (200, 201):
+            print(f"!! Gist update {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"!! Gist update chyba: {e}")
+
+
 def scan_once(state):
     found = 0
     now_ts = time.time()
+    items = []
     for name, ticker in INSTRUMENTS.items():
         df = fetch(ticker)
         if df is None:
@@ -593,6 +639,9 @@ def scan_once(state):
         highs  = list(df["High"].dropna().values)
         lows   = list(df["Low"].dropna().values)
         atr_val = atr(highs, lows, closes, ATR_PERIOD)
+
+        if len(closes) >= BREAKOUT_LOOKBACK + 2:
+            items.append(build_snapshot_item(name, closes, highs, lows, atr_val))
 
         sigs = detect_signals(name, df, atr_val)
         if not sigs:
@@ -659,6 +708,7 @@ def scan_once(state):
         if not (chart and send_telegram_photo(chart, text)):
             send_telegram(text)
         found += len(fresh)
+    publish_dashboard(items)
     return found
 
 

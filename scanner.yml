@@ -1,0 +1,41 @@
+# GitHub Actions workflow - skener trhu
+# Tento subor MUSI byt v repozitari na ceste:  .github/workflows/scanner.yml
+#
+# Spusta market_scanner.py kazdych ~5 minut v cloude (zadarmo) a posiela
+# signaly na Telegram. Ziaden pocitac nemusi byt zapnuty.
+
+name: market-scanner
+
+on:
+  schedule:
+    # kazdych 5 minut (GitHub moze mat male oneskorenie pri velkej zatazi)
+    - cron: "*/5 * * * *"
+  workflow_dispatch:        # umozni rucne spustenie tlacidlom "Run workflow"
+
+# zabrani sublihu viacerych behov naraz
+concurrency:
+  group: scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Stiahnut kod
+        uses: actions/checkout@v4
+
+      - name: Nastavit Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Nainstalovat kniznice
+        run: pip install yfinance requests pandas matplotlib
+
+      - name: Spustit skener
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_ONCE: "1"
+        run: python market_scanner.py

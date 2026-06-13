@@ -124,6 +124,18 @@ ENABLE_AI_CONTEXT = True
 AI_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 AI_MODEL   = "claude-haiku-4-5-20251001"
 
+# --- Ekonomicky kalendar (vstavany, pevne sa opakujuce udalosti) ---
+ENABLE_CALENDAR      = True
+CALENDAR_WARN_HOURS  = 2      # ku signalu prida varovanie, ak je udalost do tolkoto hodin
+ENABLE_MORNING_BRIEF = True   # ranna sumarka udalosti dna
+MORNING_BRIEF_HOUR   = 8      # hodina rannej sumarky (lokalny cas QUIET_TZ)
+
+# FOMC dni 2026 (rozhodnutie Fed o sadzbach, 14:00 ET) - overene
+FOMC_DATES = {
+    "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17",
+    "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09",
+}
+
 
 # ============================================================
 #  TELEGRAM
@@ -468,6 +480,97 @@ def make_chart(name, df):
 #  SKEN
 # ============================================================
 
+# ============================================================
+#  EKONOMICKY KALENDAR (vstavany)
+# ============================================================
+
+def _et_zone():
+    from zoneinfo import ZoneInfo
+    return ZoneInfo("America/New_York")
+
+def todays_events():
+    """Zoznam dnesnych pevnych udalosti: dict(name, when[ET datetime], affects)."""
+    if not ENABLE_CALENDAR:
+        return []
+    et = _et_zone()
+    now = dt.datetime.now(et)
+    d = now.date()
+    wd = now.weekday()           # Po=0 ... Ne=6
+    evs = []
+    def mk(h, m, name, affects):
+        evs.append({"name": name,
+                    "when": dt.datetime(d.year, d.month, d.day, h, m, tzinfo=et),
+                    "affects": affects})
+    if wd == 1:   # utorok
+        mk(16, 30, "Zasoby ropy (API, tyzdenne)", {"Ropa WTI"})
+    if wd == 2:   # streda
+        mk(10, 30, "Zasoby ropy (EIA, tyzdenne)", {"Ropa WTI"})
+    if wd == 3:   # stvrtok
+        mk(10, 30, "Zasoby plynu (EIA, tyzdenne)", {"NatGas"})
+    if wd == 4 and d.day <= 7:   # prvy piatok v mesiaci
+        mk(8, 30, "NFP - trh prace USA", "all")
+    if d.isoformat() in FOMC_DATES:
+        mk(14, 0, "FOMC - rozhodnutie Fed o sadzbach", "all")
+    return evs
+
+def event_warning_for(name):
+    """Varovanie ku signalu, ak je do CALENDAR_WARN_HOURS velka udalost pre tento trh."""
+    if not ENABLE_CALENDAR:
+        return ""
+    try:
+        from zoneinfo import ZoneInfo
+        local = ZoneInfo(QUIET_TZ)
+        now = dt.datetime.now(_et_zone())
+        out = []
+        for e in todays_events():
+            delta = (e["when"] - now).total_seconds()
+            if 0 <= delta <= CALENDAR_WARN_HOURS * 3600:
+                if e["affects"] == "all" or name in e["affects"]:
+                    t = e["when"].astimezone(local).strftime("%H:%M")
+                    out.append(f"⚠️ POZOR o {t}: {e['name']} – mozna zvysena volatilita")
+        return ("\n" + "\n".join(out)) if out else ""
+    except Exception:
+        return ""
+
+def morning_brief_text():
+    try:
+        from zoneinfo import ZoneInfo
+        local = ZoneInfo(QUIET_TZ)
+        evs = todays_events()
+        if not evs:
+            return ""
+        lines = []
+        for e in sorted(evs, key=lambda x: x["when"]):
+            t = e["when"].astimezone(local).strftime("%H:%M")
+            aff = "vsetky trhy" if e["affects"] == "all" else ", ".join(e["affects"])
+            lines.append(f"• {t} – {e['name']} ({aff})")
+        return "\U0001F4C5 <b>Dnes dolezite udalosti</b>\n" + "\n".join(lines)
+    except Exception:
+        return ""
+
+def maybe_send_morning_brief(state):
+    if not ENABLE_MORNING_BRIEF:
+        return
+    try:
+        from zoneinfo import ZoneInfo
+        now_local = dt.datetime.now(ZoneInfo(QUIET_TZ))
+    except Exception:
+        now_local = dt.datetime.now()
+    if now_local.hour < MORNING_BRIEF_HOUR:
+        return
+    key = "_brief_" + now_local.date().isoformat()
+    if state.get(key):
+        return
+    txt = morning_brief_text()
+    if txt:
+        send_telegram(txt)
+        state[key] = time.time()
+
+
+# ============================================================
+#  SKEN
+# ============================================================
+
 def fetch(ticker):
     try:
         df = yf.Ticker(ticker).history(period=PERIOD, interval=INTERVAL)
@@ -517,20 +620,38 @@ def scan_once(state):
             continue
 
         ts = dt.datetime.now().strftime("%H:%M:%S")
-        head = ""
+
+        # --- SILA SIGNALU: cervena=slaby, oranzova=stredny (RSI), zelena=zhoda ---
+        def _dot(s):
+            if conf_dir and s["dir"] == conf_dir:
+                return "\U0001F7E2"   # zelena - zhoda
+            if s["typ"].startswith("rsi"):
+                return "\U0001F7E0"   # oranzova - strednejsi (RSI ma edge)
+            return "\U0001F534"        # cervena - slaby (rapid/breakout/trend)
+
         if conf_dir:
             smer = "HORE" if conf_dir == "up" else "DOLE"
-            head = f"⭐ <b>CONFLUENCE {smer}</b> ({conf_n} signalov sa zhoduje)\n"
-        body = "\n".join(s["sprava"] for s in fresh)
+            head = (f"\U0001F7E2 <b>SILNY SIGNAL — ZHODA {smer}</b> "
+                    f"({conf_n} signalov sa zhoduje)\n")
+        elif any(s["typ"].startswith("rsi") for s in fresh):
+            head = "\U0001F7E0 <b>STREDNY SIGNAL</b>\n"
+        else:
+            head = "\U0001F534 <b>SLABY SIGNAL</b>\n"
+
+        body = "\n".join(f"{_dot(s)} {s['sprava']}" for s in fresh)
+        legenda = "\n\n🔴 slabý  🟠 strednejší  🟢 zhoda viacerých"
 
         # riziko (podla prveho signalu / jeho smeru)
         direction = fresh[0]["dir"]
         risk = compute_risk(name, direction, closes[-1], atr_val)
 
+        # varovanie na ekonomicku udalost
+        warn = event_warning_for(name)
+
         # AI kontext
         ai = ai_context(head + body)
 
-        text = f"{head}{body}{risk}{ai}\n⏱ {ts}"
+        text = f"{head}{body}{risk}{warn}{ai}{legenda}\n⏱ {ts}"
         for s in fresh:
             print(f"[SIGNAL] {s['sprava']}")
 
@@ -577,6 +698,7 @@ def main():
     state = load_state()
 
     if os.environ.get("RUN_ONCE", "").strip() in ("1", "true", "True", "yes"):
+        maybe_send_morning_brief(state)
         n = scan_once(state)
         save_state(state)
         print(f"[RUN_ONCE] sken hotovy, signalov: {n}")
@@ -586,6 +708,7 @@ def main():
     while True:
         try:
             if not in_quiet_hours():
+                maybe_send_morning_brief(state)
                 n = scan_once(state)
                 save_state(state)
                 print(f"[{dt.datetime.now():%H:%M:%S}] sken hotovy, signalov: {n}")

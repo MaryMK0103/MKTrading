@@ -1,0 +1,33 @@
+# GitHub Actions workflow - backtest (rucne spustenie)
+# Cesta v repozitari:  .github/workflows/backtest.yml
+#
+# Spusti sa LEN rucne (tlacidlo "Run workflow"). Prejde historiu a posle
+# zhrnutie uspesnosti signalov na Telegram (a do logu behu).
+
+name: backtest
+
+on:
+  workflow_dispatch:
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Stiahnut kod
+        uses: actions/checkout@v4
+
+      - name: Nastavit Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Nainstalovat kniznice
+        run: pip install yfinance requests pandas
+
+      - name: Spustit backtest
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BT_TELEGRAM: "1"
+        run: python backtest.py

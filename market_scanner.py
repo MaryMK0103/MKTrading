@@ -1,20 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-market_scanner.py
------------------
-Skener trhu, ktory ta UPOZORNI cez Telegram, ked na sledovanych instrumentoch
-uvidi: (1) rychly pokles/narast ceny, (2) zmenu trendu (kriz kluzavych priemerov),
-(3) prelomenie hladiny (breakout).
+market_scanner.py  (v2)
+-----------------------
+Skener trhu s upozorneniami na Telegram. NEOBCHODUJE - len pozoruje a posiela
+signaly, rozhodnutie je na tebe.
 
-NEOBCHODUJE automaticky. Len pozoruje a posiela signaly. Rozhodnutie je na tebe.
+Novinky vo v2:
+  * Trvala pamat (state.json) - cooldown funguje aj napric behmi v cloude
+  * ATR-based prahy - prah sa prisposobi volatilite kazdeho trhu
+  * Confluence - zvyrazni, ked sa zhodne viac signalov naraz
+  * Filter vyssieho timeframe (1h trend) - tlmenie protitrendovych signalov
+  * Riziko v sprave - orientacny stop, R:R ciel a velkost pozicie
+  * Tiche hodiny - v zadanom okne neposiela
+  * Volitelny AI kontext - kratky komentar ku signalu (ak je nastaveny API kluc)
 
-Data: yfinance (zadarmo, mierne oneskorene - radovo minuty).
-Spustenie: python market_scanner.py
+Data: yfinance (zadarmo, mierne oneskorene).
+Spustenie lokalne:    python market_scanner.py
+V cloude (GitHub):    nastav RUN_ONCE=1 (urobi 1 sken a skonci)
 """
 
 import os
+import json
 import time
+import math
 import datetime as dt
 
 import requests
@@ -22,116 +31,133 @@ import requests
 try:
     import yfinance as yf
 except ImportError:
-    raise SystemExit("Chyba: chyba kniznica yfinance. Spusti: pip install yfinance requests")
+    raise SystemExit("Chyba: chyba kniznica yfinance. Spusti: pip install yfinance requests pandas")
 
 
 # ============================================================
-#  KONFIGURACIA  -  toto si uprav podla seba
+#  KONFIGURACIA
 # ============================================================
 
-# --- Telegram (vid README ako ziskat token a chat_id) ---
-# Token a chat_id mozes zadat tu, alebo cez premenne prostredia
-# TELEGRAM_BOT_TOKEN a TELEGRAM_CHAT_ID (bezpecnejsie).
-# Token a chat_id sa citaju z premennych prostredia (GitHub Secrets v cloude).
-# NEVKLADAJ token priamo sem, ak ma byt repozitar verejny!
+# --- Telegram (z premennych prostredia / GitHub Secrets) ---
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# --- Instrumenty: nazov  ->  yfinance ticker ---
+# --- Instrumenty: nazov -> yfinance ticker ---
 INSTRUMENTS = {
-    "Zlato (XAU/USD)":   "GC=F",     # Gold futures
-    "Striebro (XAG/USD)":"SI=F",     # Silver futures
-    "US100 (Nasdaq)":    "NQ=F",     # Nasdaq-100 futures
-    "US30 (Dow)":        "YM=F",     # Dow futures
-    "US500 (S&P 500)":   "ES=F",     # S&P 500 futures
-    "DE40 (DAX)":        "^GDAXI",   # DAX index
-    "Ropa WTI":          "CL=F",     # Crude Oil WTI futures
-    "NatGas":            "NG=F",     # Natural Gas futures
+    "Zlato (XAU/USD)":   "GC=F",
+    "Striebro (XAG/USD)":"SI=F",
+    "US100 (Nasdaq)":    "NQ=F",
+    "US30 (Dow)":        "YM=F",
+    "US500 (S&P 500)":   "ES=F",
+    "DE40 (DAX)":        "^GDAXI",
+    "Ropa WTI":          "CL=F",
+    "NatGas":            "NG=F",
 }
 
-# --- Ako casto skenovat (sekundy) ---
+# Hodnota 1 bodu pohybu na 1 jednotku/lot (uprav podla svojho brokera/CFD!).
+# Sluzi LEN na orientacny vypocet velkosti pozicie. 1.0 = neutralne.
+POINT_VALUE = {}   # napr. {"Zlato (XAU/USD)": 1.0, "US100 (Nasdaq)": 1.0}
+
 POLL_SECONDS = 60
+INTERVAL = "5m"
+PERIOD   = "5d"
 
-# --- Parametre sviecky / historie ---
-INTERVAL = "5m"      # velkost sviecky: 1m, 2m, 5m, 15m...
-PERIOD   = "2d"      # kolko historie nacitat (potrebne na priemery)
+# --- Rychly pohyb ---
+RAPID_BARS     = 3           # za kolko sviecok meriame pohyb
+RAPID_ATR_MULT = 1.0         # pohyb > nasobok ATR -> signal (volatilite na mieru)
+RAPID_PCT_MIN  = 0.15        # poistka: aspon tolko % (aby nepipalo pri mrtvom trhu)
 
-# --- Prah pre RYCHLY POHYB ---
-# Ak sa cena pohne o viac ako X % za RAPID_BARS sviecok -> signal.
-RAPID_PCT  = 0.30    # v percentach (0.30 = 0,3 %)
-RAPID_BARS = 3       # pocet sviecok (3 x 5m = 15 minut)
-
-# --- Parametre TREND (kriz kluzavych priemerov EMA) ---
+# --- Trend (EMA kriz) ---
 EMA_FAST = 9
 EMA_SLOW = 21
 
-# --- Parametre BREAKOUT (prelomenie hladiny) ---
-# Cena prelomi maximum/minimum poslednych N sviecok (okrem aktualnej).
-BREAKOUT_LOOKBACK = 24   # 24 x 5m = 2 hodiny
+# --- Breakout ---
+BREAKOUT_LOOKBACK = 24
 
-# --- Parametre RSI ---
+# --- RSI ---
 RSI_PERIOD     = 14
-RSI_OVERBOUGHT = 70      # nad tymto = prekupene (mozny obrat dole)
-RSI_OVERSOLD   = 30      # pod tymto = prepredane (mozny obrat hore)
+RSI_OVERBOUGHT = 70
+RSI_OVERSOLD   = 30
 
-# --- Ktore signaly chces (True/False) ---
+# --- ATR ---
+ATR_PERIOD = 14
+
+# --- Ktore signaly ---
 ENABLE_RAPID    = True
 ENABLE_TREND    = True
 ENABLE_BREAKOUT = True
 ENABLE_RSI      = True
 
-# --- Posielat ku signalu aj graf (obrazok)? ---
-SEND_CHART  = True
-CHART_BARS  = 60         # kolko poslednych sviecok vykreslit
+# --- Filter vyssieho timeframe (1h trend cez EMA) ---
+ENABLE_HTF_FILTER = True
+HTF_INTERVAL = "1h"
+HTF_PERIOD   = "1mo"
+HTF_EMA      = 50            # smer trendu na 1h podla EMA(50)
 
-# --- Cooldown: rovnaky typ signalu pre rovnaky instrument
-#     sa znovu neposle skor ako po tolkoto minutach (proti spamu) ---
+# --- Confluence ---
+# True = posli LEN ked sa zhodnu 2+ signaly rovnakeho smeru.
+# False = posli vsetko, ale zhodu zvyrazni.
+CONFLUENCE_ONLY = False
+
+# --- Riziko (orientacne!) ---
+SHOW_RISK       = True
+ACCOUNT_BALANCE = 1000.0     # velkost uctu (v mene uctu)
+RISK_PCT        = 1.0        # kolko % uctu riskujes na obchod
+STOP_ATR_MULT   = 1.5        # stop = nasobok ATR od vstupu
+TARGET_RR       = 1.5        # ciel = nasobok rizika (R:R)
+
+# --- Graf ---
+SEND_CHART = True
+CHART_BARS = 60
+
+# --- Cooldown (minuty) - drzi napric behmi vdaka state.json ---
 COOLDOWN_MINUTES = 30
+STATE_FILE = os.environ.get("STATE_FILE", "state.json")
+
+# --- Tiche hodiny (lokalny cas TZ). Rovnake = vypnute. ---
+QUIET_TZ    = "Europe/Bratislava"
+QUIET_START = 0              # hodina (0-23)
+QUIET_END   = 0             # hodina (0-23); priklad: 23 a 7 = ticho 23:00-07:00
+
+# --- AI kontext (volitelny). Ak je nastaveny ANTHROPIC_API_KEY, prida komentar. ---
+ENABLE_AI_CONTEXT = True
+AI_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+AI_MODEL   = "claude-haiku-4-5-20251001"
 
 
 # ============================================================
 #  TELEGRAM
 # ============================================================
 
-def resolve_chat_id() -> str:
-    """Zisti chat_id z poslednej spravy poslanej botovi (getUpdates)."""
+def resolve_chat_id():
     global TELEGRAM_CHAT_ID
     if TELEGRAM_CHAT_ID:
         return TELEGRAM_CHAT_ID
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
     try:
-        r = requests.get(url, timeout=15)
-        data = r.json()
-        for upd in reversed(data.get("result", [])):
+        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates", timeout=15)
+        for upd in reversed(r.json().get("result", [])):
             msg = upd.get("message") or upd.get("channel_post")
             if msg and "chat" in msg:
                 TELEGRAM_CHAT_ID = str(msg["chat"]["id"])
-                print(f"   Zistene chat_id: {TELEGRAM_CHAT_ID}")
                 return TELEGRAM_CHAT_ID
     except Exception as e:
         print(f"!! Nepodarilo sa zistit chat_id: {e}")
     return ""
 
 
-def send_telegram(text: str) -> bool:
-    """Posle spravu na Telegram. Vrati True ak OK."""
-    if "SEM_VLOZ" in TELEGRAM_BOT_TOKEN or not TELEGRAM_BOT_TOKEN:
-        print("!! Telegram token chyba - vypisujem len do konzoly:")
-        print("   " + text.replace("\n", "\n   "))
+def send_telegram(text):
+    if not TELEGRAM_BOT_TOKEN:
+        print("!! Telegram token chyba - vypis do konzoly:\n   " + text.replace("\n", "\n   "))
         return False
     chat_id = resolve_chat_id()
     if not chat_id:
-        print("!! Nemam chat_id. Napis botovi v Telegrame spravu a skus znova.")
-        print("   " + text.replace("\n", "\n   "))
+        print("!! Nemam chat_id.\n   " + text.replace("\n", "\n   "))
         return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        r = requests.post(url, data={
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }, timeout=15)
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data={"chat_id": chat_id, "text": text, "parse_mode": "HTML",
+                  "disable_web_page_preview": True}, timeout=15)
         if r.status_code != 200:
             print(f"!! Telegram chyba {r.status_code}: {r.text}")
             return False
@@ -141,15 +167,31 @@ def send_telegram(text: str) -> bool:
         return False
 
 
+def send_telegram_photo(path, caption):
+    if not TELEGRAM_BOT_TOKEN:
+        return False
+    chat_id = resolve_chat_id()
+    if not chat_id:
+        return False
+    try:
+        with open(path, "rb") as f:
+            r = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+                data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
+                files={"photo": f}, timeout=30)
+        return r.status_code == 200
+    except Exception as e:
+        print(f"!! Telegram foto chyba: {e}")
+        return False
+
+
 # ============================================================
 #  INDIKATORY
 # ============================================================
 
 def ema(values, span):
-    """Exponencialny kluzavy priemer (bez pandas zavislosti na .ewm pre istotu)."""
     k = 2.0 / (span + 1.0)
-    out = []
-    prev = None
+    out, prev = [], None
     for v in values:
         prev = v if prev is None else (v * k + prev * (1.0 - k))
         out.append(prev)
@@ -157,120 +199,236 @@ def ema(values, span):
 
 
 def rsi(values, period=14):
-    """RSI (Wilderov vyhladeny). Vrati zoznam rovnakej dlzky, zaciatok = None."""
     if len(values) <= period:
         return [None] * len(values)
-    gains, losses = [], []
+    g, l = [], []
     for i in range(1, len(values)):
         ch = values[i] - values[i - 1]
-        gains.append(max(ch, 0.0))
-        losses.append(max(-ch, 0.0))
+        g.append(max(ch, 0.0)); l.append(max(-ch, 0.0))
     out = [None] * len(values)
-    avg_g = sum(gains[:period]) / period
-    avg_l = sum(losses[:period]) / period
-    def _calc(ag, al):
-        if al == 0:
-            return 100.0
-        rs = ag / al
-        return 100.0 - (100.0 / (1.0 + rs))
-    out[period] = _calc(avg_g, avg_l)
+    ag = sum(g[:period]) / period; al = sum(l[:period]) / period
+    calc = lambda ag, al: 100.0 if al == 0 else 100.0 - (100.0 / (1.0 + ag / al))
+    out[period] = calc(ag, al)
     for i in range(period + 1, len(values)):
-        avg_g = (avg_g * (period - 1) + gains[i - 1]) / period
-        avg_l = (avg_l * (period - 1) + losses[i - 1]) / period
-        out[i] = _calc(avg_g, avg_l)
+        ag = (ag * (period - 1) + g[i - 1]) / period
+        al = (al * (period - 1) + l[i - 1]) / period
+        out[i] = calc(ag, al)
     return out
+
+
+def atr(highs, lows, closes, period=14):
+    """Average True Range (Wilder). Vrati poslednu hodnotu alebo None."""
+    n = len(closes)
+    if n < period + 1:
+        return None
+    trs = []
+    for i in range(1, n):
+        tr = max(highs[i] - lows[i],
+                 abs(highs[i] - closes[i - 1]),
+                 abs(lows[i] - closes[i - 1]))
+        trs.append(tr)
+    a = sum(trs[:period]) / period
+    for i in range(period, len(trs)):
+        a = (a * (period - 1) + trs[i]) / period
+    return a
+
+
+# ============================================================
+#  STAV (proti duplicitam, napric behmi)
+# ============================================================
+
+def load_state():
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except Exception as e:
+        print(f"!! Nepodarilo sa ulozit state: {e}")
+
+
+def recently_alerted(state, key, now_ts):
+    last = state.get(key)
+    if last is None:
+        return False
+    return (now_ts - last) < COOLDOWN_MINUTES * 60
+
+
+def mark_alerted(state, key, now_ts):
+    state[key] = now_ts
+
+
+# ============================================================
+#  RIZIKO
+# ============================================================
+
+def compute_risk(name, direction, last, atr_val):
+    """Vrati text s orientacnym stopom, cielom a velkostou pozicie."""
+    if not SHOW_RISK or not atr_val or atr_val <= 0:
+        return ""
+    risk_dist = STOP_ATR_MULT * atr_val
+    if direction == "up":
+        stop = last - risk_dist
+        target = last + TARGET_RR * risk_dist
+    else:
+        stop = last + risk_dist
+        target = last - TARGET_RR * risk_dist
+    pv = POINT_VALUE.get(name, 1.0)
+    risk_money = ACCOUNT_BALANCE * RISK_PCT / 100.0
+    size = risk_money / (risk_dist * pv) if (risk_dist * pv) > 0 else 0
+    return (f"\n\U0001F6E1 vstup ~{last:.2f} | stop ~{stop:.2f} | ciel ~{target:.2f} (R:R {TARGET_RR:g})"
+            f"\n\U0001F4CF riziko {RISK_PCT:g}% = {risk_money:.0f}, ~{size:.2f} jednotiek "
+            f"(over si hodnotu bodu pre {name.split()[0]}!)")
+
+
+# ============================================================
+#  AI KONTEXT (volitelny)
+# ============================================================
+
+def ai_context(summary):
+    if not (ENABLE_AI_CONTEXT and AI_API_KEY):
+        return ""
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": AI_API_KEY, "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
+            json={"model": AI_MODEL, "max_tokens": 120,
+                  "messages": [{"role": "user", "content":
+                      "Si strucny trading asistent. K tomuto signalu napis JEDNU vetu po slovensky "
+                      "s kontextom (co to znamena, na co si dat pozor). Ziadne odporucanie na obchod.\n\n"
+                      + summary}]},
+            timeout=20)
+        data = r.json()
+        txt = "".join(b.get("text", "") for b in data.get("content", []))
+        return ("\n\U0001F4AC " + txt.strip()) if txt.strip() else ""
+    except Exception as e:
+        print(f"!! AI kontext chyba: {e}")
+        return ""
+
+
+# ============================================================
+#  HTF FILTER (1h trend)
+# ============================================================
+
+_htf_cache = {}
+
+def htf_trend(ticker):
+    """Vrati 'up'/'down'/None podla polohy ceny voci EMA na 1h."""
+    if not ENABLE_HTF_FILTER:
+        return None
+    if ticker in _htf_cache:
+        return _htf_cache[ticker]
+    try:
+        df = yf.Ticker(ticker).history(period=HTF_PERIOD, interval=HTF_INTERVAL)
+        closes = list(df["Close"].dropna().values)
+        if len(closes) < HTF_EMA + 2:
+            _htf_cache[ticker] = None
+            return None
+        e = ema(closes, HTF_EMA)
+        trend = "up" if closes[-1] >= e[-1] else "down"
+        _htf_cache[ticker] = trend
+        return trend
+    except Exception:
+        _htf_cache[ticker] = None
+        return None
 
 
 # ============================================================
 #  DETEKCIA SIGNALOV
 # ============================================================
 
-def detect_signals(name, df):
-    """
-    Vrati zoznam signalov (dict: typ, smer, sprava) z dataframe so stlpcami
-    Open/High/Low/Close. Pracuje s poslednou UZAVRETOU sviecou.
-    """
+def detect_signals(name, df, atr_val):
     signals = []
     closes = list(df["Close"].dropna().values)
     highs  = list(df["High"].dropna().values)
     lows   = list(df["Low"].dropna().values)
 
-    if len(closes) < max(EMA_SLOW + 2, RAPID_BARS + 1, BREAKOUT_LOOKBACK + 2):
-        return signals  # malo dat
-
+    if len(closes) < max(EMA_SLOW + 2, RAPID_BARS + 1, BREAKOUT_LOOKBACK + 2, ATR_PERIOD + 2):
+        return signals
     last = closes[-1]
 
-    # --- 1) RYCHLY POHYB ---
-    if ENABLE_RAPID:
+    # 1) RYCHLY POHYB (ATR-based)
+    if ENABLE_RAPID and atr_val:
         ref = closes[-1 - RAPID_BARS]
-        if ref:
-            pct = (last - ref) / ref * 100.0
-            if abs(pct) >= RAPID_PCT:
-                smer = "NARAST" if pct > 0 else "POKLES"
-                sip = "\U0001F4C8" if pct > 0 else "\U0001F4C9"
-                signals.append({
-                    "typ": "rapid",
-                    "sprava": f"{sip} <b>RYCHLY {smer}</b> {name}: {pct:+.2f} % "
-                              f"za ~{RAPID_BARS*int(INTERVAL.rstrip('m'))} min (cena {last:.2f})",
-                })
+        move = last - ref
+        pct = (move / ref * 100.0) if ref else 0.0
+        if abs(move) >= RAPID_ATR_MULT * atr_val and abs(pct) >= RAPID_PCT_MIN:
+            d = "up" if move > 0 else "down"
+            sip = "\U0001F4C8" if d == "up" else "\U0001F4C9"
+            smer = "NARAST" if d == "up" else "POKLES"
+            signals.append({"typ": "rapid", "dir": d,
+                "sprava": f"{sip} <b>RYCHLY {smer}</b> {name}: {pct:+.2f} % "
+                          f"za ~{RAPID_BARS*int(INTERVAL.rstrip('m'))} min (cena {last:.2f})"})
 
-    # --- 2) TREND: kriz EMA ---
+    # 2) TREND (EMA kriz)
     if ENABLE_TREND:
-        ef = ema(closes, EMA_FAST)
-        es = ema(closes, EMA_SLOW)
-        # kriz medzi predposlednou a poslednou sviecou
+        ef = ema(closes, EMA_FAST); es = ema(closes, EMA_SLOW)
         if ef[-2] <= es[-2] and ef[-1] > es[-1]:
-            signals.append({
-                "typ": "trend_up",
+            signals.append({"typ": "trend_up", "dir": "up",
                 "sprava": f"\U0001F7E2 <b>TREND HORE</b> {name}: EMA{EMA_FAST} prerazila "
-                          f"EMA{EMA_SLOW} zdola (cena {last:.2f})",
-            })
+                          f"EMA{EMA_SLOW} zdola (cena {last:.2f})"})
         elif ef[-2] >= es[-2] and ef[-1] < es[-1]:
-            signals.append({
-                "typ": "trend_down",
+            signals.append({"typ": "trend_down", "dir": "down",
                 "sprava": f"\U0001F534 <b>TREND DOLE</b> {name}: EMA{EMA_FAST} prerazila "
-                          f"EMA{EMA_SLOW} zhora (cena {last:.2f})",
-            })
+                          f"EMA{EMA_SLOW} zhora (cena {last:.2f})"})
 
-    # --- 3) BREAKOUT: prelomenie hladiny (edge-triggered: len v momente prerazenia) ---
+    # 3) BREAKOUT (edge-triggered)
     if ENABLE_BREAKOUT:
         prev = closes[-2]
-        window_high = max(highs[-2 - BREAKOUT_LOOKBACK:-2])  # po predposlednu sviecu
-        window_low  = min(lows[-2 - BREAKOUT_LOOKBACK:-2])
-        if prev <= window_high and last > window_high:
-            signals.append({
-                "typ": "breakout_up",
+        wh = max(highs[-2 - BREAKOUT_LOOKBACK:-2])
+        wl = min(lows[-2 - BREAKOUT_LOOKBACK:-2])
+        mins = BREAKOUT_LOOKBACK * int(INTERVAL.rstrip("m"))
+        if prev <= wh and last > wh:
+            signals.append({"typ": "breakout_up", "dir": "up",
                 "sprava": f"\U0001F680 <b>BREAKOUT HORE</b> {name}: cena {last:.2f} "
-                          f"prerazila {BREAKOUT_LOOKBACK*int(INTERVAL.rstrip('m'))}-min "
-                          f"maximum {window_high:.2f}",
-            })
-        elif prev >= window_low and last < window_low:
-            signals.append({
-                "typ": "breakout_down",
+                          f"prerazila {mins}-min maximum {wh:.2f}"})
+        elif prev >= wl and last < wl:
+            signals.append({"typ": "breakout_down", "dir": "down",
                 "sprava": f"⚠️ <b>BREAKOUT DOLE</b> {name}: cena {last:.2f} "
-                          f"prerazila {BREAKOUT_LOOKBACK*int(INTERVAL.rstrip('m'))}-min "
-                          f"minimum {window_low:.2f}",
-            })
+                          f"prerazila {mins}-min minimum {wl:.2f}"})
 
-    # --- 4) RSI extremy (edge-triggered: len ked RSI prave prekroci hranicu) ---
+    # 4) RSI (edge-triggered)
     if ENABLE_RSI:
         r = rsi(closes, RSI_PERIOD)
         if r[-1] is not None and r[-2] is not None:
-            val, prev_val = r[-1], r[-2]
-            if prev_val < RSI_OVERBOUGHT and val >= RSI_OVERBOUGHT:
-                signals.append({
-                    "typ": "rsi_overbought",
+            val, pv = r[-1], r[-2]
+            if pv < RSI_OVERBOUGHT and val >= RSI_OVERBOUGHT:
+                signals.append({"typ": "rsi_overbought", "dir": "down",
                     "sprava": f"\U0001F525 <b>RSI PREKUPENE</b> {name}: RSI {val:.0f} "
-                              f"(prekrocilo {RSI_OVERBOUGHT}) - mozny obrat dole (cena {last:.2f})",
-                })
-            elif prev_val > RSI_OVERSOLD and val <= RSI_OVERSOLD:
-                signals.append({
-                    "typ": "rsi_oversold",
+                              f"(prekrocilo {RSI_OVERBOUGHT}) - mozny obrat dole (cena {last:.2f})"})
+            elif pv > RSI_OVERSOLD and val <= RSI_OVERSOLD:
+                signals.append({"typ": "rsi_oversold", "dir": "up",
                     "sprava": f"\U0001F9CA <b>RSI PREPREDANE</b> {name}: RSI {val:.0f} "
-                              f"(kleslo pod {RSI_OVERSOLD}) - mozny obrat hore (cena {last:.2f})",
-                })
+                              f"(kleslo pod {RSI_OVERSOLD}) - mozny obrat hore (cena {last:.2f})"})
 
     return signals
+
+
+def apply_htf_filter(ticker, signals):
+    """Odstrani signaly proti 1h trendu."""
+    trend = htf_trend(ticker)
+    if trend is None:
+        return signals, None
+    kept = [s for s in signals if s["dir"] == trend]
+    return kept, trend
+
+
+def confluence_tag(signals):
+    """Vrati ('up'/'down', pocet) ak sa zhoduju 2+ signaly v smere, inak (None,0)."""
+    ups = [s for s in signals if s["dir"] == "up"]
+    downs = [s for s in signals if s["dir"] == "down"]
+    if len(ups) >= 2:
+        return "up", len(ups)
+    if len(downs) >= 2:
+        return "down", len(downs)
+    return None, 0
 
 
 # ============================================================
@@ -278,7 +436,6 @@ def detect_signals(name, df):
 # ============================================================
 
 def make_chart(name, df):
-    """Vykresli posledne sviecky + EMA a vrati cestu k PNG (alebo None)."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -290,69 +447,28 @@ def make_chart(name, df):
         closes = list(sub["Close"].values)
         if len(closes) < 5:
             return None
-        ef = ema(closes, EMA_FAST)
-        es = ema(closes, EMA_SLOW)
+        ef = ema(closes, EMA_FAST); es = ema(closes, EMA_SLOW)
         x = range(len(closes))
         fig, ax = plt.subplots(figsize=(8, 4))
         ax.plot(x, closes, color="#222", linewidth=1.6, label="Cena")
         ax.plot(x, ef, color="#1f9d55", linewidth=1.0, label=f"EMA{EMA_FAST}")
         ax.plot(x, es, color="#c0392b", linewidth=1.0, label=f"EMA{EMA_SLOW}")
-        ax.set_title(name)
-        ax.legend(loc="upper left", fontsize=8)
-        ax.grid(alpha=0.25)
+        ax.set_title(name); ax.legend(loc="upper left", fontsize=8); ax.grid(alpha=0.25)
         fig.tight_layout()
-        path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            f"_chart_{name.split()[0].replace('/', '')}.png",
-        )
-        fig.savefig(path, dpi=90)
-        plt.close(fig)
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            f"_chart_{name.split()[0].replace('/', '')}.png")
+        fig.savefig(path, dpi=90); plt.close(fig)
         return path
     except Exception as e:
         print(f"!! Chyba pri grafe: {e}")
         return None
 
 
-def send_telegram_photo(path: str, caption: str) -> bool:
-    """Posle obrazok na Telegram."""
-    if "SEM_VLOZ" in TELEGRAM_BOT_TOKEN or not TELEGRAM_BOT_TOKEN:
-        return False
-    chat_id = resolve_chat_id()
-    if not chat_id:
-        return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-    try:
-        with open(path, "rb") as f:
-            r = requests.post(
-                url,
-                data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
-                files={"photo": f},
-                timeout=30,
-            )
-        return r.status_code == 200
-    except Exception as e:
-        print(f"!! Telegram foto chyba: {e}")
-        return False
-
-
 # ============================================================
-#  HLAVNA SLUCKA
+#  SKEN
 # ============================================================
-
-_last_alert = {}  # (instrument, typ) -> datetime poslednej spravy
-
-def on_cooldown(name, typ):
-    key = (name, typ)
-    now = dt.datetime.now()
-    last = _last_alert.get(key)
-    if last and (now - last).total_seconds() < COOLDOWN_MINUTES * 60:
-        return True
-    _last_alert[key] = now
-    return False
-
 
 def fetch(ticker):
-    """Nacita historiu pre ticker. Vrati DataFrame alebo None."""
     try:
         df = yf.Ticker(ticker).history(period=PERIOD, interval=INTERVAL)
         if df is None or df.empty:
@@ -363,54 +479,118 @@ def fetch(ticker):
         return None
 
 
-def scan_once():
+def scan_once(state):
     found = 0
+    now_ts = time.time()
     for name, ticker in INSTRUMENTS.items():
         df = fetch(ticker)
         if df is None:
             continue
-        fresh = [s for s in detect_signals(name, df) if not on_cooldown(name, s["typ"])]
+        closes = list(df["Close"].dropna().values)
+        highs  = list(df["High"].dropna().values)
+        lows   = list(df["Low"].dropna().values)
+        atr_val = atr(highs, lows, closes, ATR_PERIOD)
+
+        sigs = detect_signals(name, df, atr_val)
+        if not sigs:
+            continue
+
+        # filter vyssieho timeframe
+        sigs, trend = apply_htf_filter(ticker, sigs)
+        if not sigs:
+            continue
+
+        # confluence
+        conf_dir, conf_n = confluence_tag(sigs)
+        if CONFLUENCE_ONLY and conf_dir is None:
+            continue
+
+        # dedup napric behmi
+        fresh = []
+        for s in sigs:
+            key = f"{name}|{s['typ']}"
+            if recently_alerted(state, key, now_ts):
+                continue
+            mark_alerted(state, key, now_ts)
+            fresh.append(s)
         if not fresh:
             continue
+
         ts = dt.datetime.now().strftime("%H:%M:%S")
-        for sig in fresh:
-            print(f"[SIGNAL] {sig['sprava']}")
-        text = "\n".join(s["sprava"] for s in fresh) + f"\n⏱ {ts}"
+        head = ""
+        if conf_dir:
+            smer = "HORE" if conf_dir == "up" else "DOLE"
+            head = f"⭐ <b>CONFLUENCE {smer}</b> ({conf_n} signalov sa zhoduje)\n"
+        body = "\n".join(s["sprava"] for s in fresh)
+
+        # riziko (podla prveho signalu / jeho smeru)
+        direction = fresh[0]["dir"]
+        risk = compute_risk(name, direction, closes[-1], atr_val)
+
+        # AI kontext
+        ai = ai_context(head + body)
+
+        text = f"{head}{body}{risk}{ai}\n⏱ {ts}"
+        for s in fresh:
+            print(f"[SIGNAL] {s['sprava']}")
+
         chart = make_chart(name, df) if SEND_CHART else None
-        if chart and send_telegram_photo(chart, text):
-            pass  # graf + popis odoslane spolu
-        else:
+        if not (chart and send_telegram_photo(chart, text)):
             send_telegram(text)
         found += len(fresh)
     return found
 
 
+# ============================================================
+#  TICHE HODINY
+# ============================================================
+
+def in_quiet_hours():
+    if QUIET_START == QUIET_END:
+        return False
+    try:
+        from zoneinfo import ZoneInfo
+        h = dt.datetime.now(ZoneInfo(QUIET_TZ)).hour
+    except Exception:
+        h = dt.datetime.now().hour
+    if QUIET_START < QUIET_END:
+        return QUIET_START <= h < QUIET_END
+    return h >= QUIET_START or h < QUIET_END   # cez polnoc
+
+
+# ============================================================
+#  MAIN
+# ============================================================
+
 def main():
     print("=" * 60)
-    print(" SKENER TRHU - spusteny")
+    print(" SKENER TRHU v2 - spusteny")
     print(f" Instrumenty: {', '.join(INSTRUMENTS.keys())}")
-    print(f" Interval skenu: {POLL_SECONDS}s | sviecka: {INTERVAL}")
-    print(f" Signaly: rapid={ENABLE_RAPID} trend={ENABLE_TREND} "
-          f"breakout={ENABLE_BREAKOUT} rsi={ENABLE_RSI} graf={SEND_CHART}")
+    print(f" Sviecka: {INTERVAL} | HTF filter: {ENABLE_HTF_FILTER} | "
+          f"AI: {bool(AI_API_KEY)} | confluence_only: {CONFLUENCE_ONLY}")
     print("=" * 60)
 
-    # RUN_ONCE: jeden sken a koniec (pre GitHub Actions / cloud cron).
+    if in_quiet_hours():
+        print("[QUIET] tiche hodiny - sken sa neposiela.")
+        return
+
+    state = load_state()
+
     if os.environ.get("RUN_ONCE", "").strip() in ("1", "true", "True", "yes"):
-        n = scan_once()
+        n = scan_once(state)
+        save_state(state)
         print(f"[RUN_ONCE] sken hotovy, signalov: {n}")
         return
 
-    # uvodna sprava do Telegramu (test spojenia)
-    send_telegram("✅ Skener trhu spusteny a sleduje trh.")
-
+    send_telegram("✅ Skener trhu v2 spusteny a sleduje trh.")
     while True:
         try:
-            n = scan_once()
-            stamp = dt.datetime.now().strftime("%H:%M:%S")
-            print(f"[{stamp}] sken hotovy, signalov: {n}")
+            if not in_quiet_hours():
+                n = scan_once(state)
+                save_state(state)
+                print(f"[{dt.datetime.now():%H:%M:%S}] sken hotovy, signalov: {n}")
         except KeyboardInterrupt:
-            print("\nUkoncene pouzivatelom.")
-            break
+            print("\nUkoncene pouzivatelom."); break
         except Exception as e:
             print(f"!! Chyba v slucke: {e}")
         time.sleep(POLL_SECONDS)

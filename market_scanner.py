@@ -102,7 +102,7 @@ CONFLUENCE_ONLY = False
 # --- Riziko (orientacne!) ---
 SHOW_RISK       = True
 ACCOUNT_BALANCE = 1000.0     # velkost uctu (v mene uctu)
-RISK_PCT        = 1.0        # kolko % uctu riskujes na obchod
+RISK_PCT        = 2.0        # kolko % uctu riskujes na obchod
 STOP_ATR_MULT   = 1.5        # stop = nasobok ATR od vstupu
 TARGET_RR       = 1.5        # ciel = nasobok rizika (R:R)
 
@@ -116,8 +116,8 @@ STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 
 # --- Tiche hodiny (lokalny cas TZ). Rovnake = vypnute. ---
 QUIET_TZ    = "Europe/Bratislava"
-QUIET_START = 0              # hodina (0-23)
-QUIET_END   = 0             # hodina (0-23); priklad: 23 a 7 = ticho 23:00-07:00
+QUIET_START = 23             # hodina (0-23)
+QUIET_END   = 7             # hodina (0-23); priklad: 23 a 7 = ticho 23:00-07:00
 
 # --- AI kontext (volitelny). Ak je nastaveny ANTHROPIC_API_KEY, prida komentar. ---
 ENABLE_AI_CONTEXT = True

@@ -600,10 +600,52 @@ def build_snapshot_item(name, closes, highs, lows, atr_val):
                or last > wh or last < wl or abs(chg) >= RAPID_PCT_MIN * 2)
     moderate = (rsi_v >= 60 or rsi_v <= 40 or abs(chg) >= RAPID_PCT_MIN)
     status = "green" if extreme else ("orange" if moderate else "gray")
+
+    # --- seria pre graf (poslednych W sviecok) + znacky signalov ---
+    W = 48
+    n = len(closes)
+    s = max(0, n - W)
+    c_w  = [round(float(x), 4) for x in closes[s:]]
+    ef_w = [round(float(x), 4) for x in ef[s:]]
+    es_w = [round(float(x), 4) for x in es[s:]]
+    rsi_w = [None if r[i] is None else round(float(r[i])) for i in range(s, n)]
+    marks = []
+    for i in range(max(s, 2), n):
+        x = i - s
+        if ef[i - 1] <= es[i - 1] and ef[i] > es[i]:
+            marks.append({"x": x, "t": "trend", "d": "up"})
+        elif ef[i - 1] >= es[i - 1] and ef[i] < es[i]:
+            marks.append({"x": x, "t": "trend", "d": "down"})
+        if i >= BREAKOUT_LOOKBACK + 2:
+            wh2 = max(highs[i - 1 - BREAKOUT_LOOKBACK:i - 1])
+            wl2 = min(lows[i - 1 - BREAKOUT_LOOKBACK:i - 1])
+            if closes[i - 1] <= wh2 and closes[i] > wh2:
+                marks.append({"x": x, "t": "breakout", "d": "up"})
+            elif closes[i - 1] >= wl2 and closes[i] < wl2:
+                marks.append({"x": x, "t": "breakout", "d": "down"})
+        if r[i] is not None and r[i - 1] is not None:
+            if r[i - 1] < RSI_OVERBOUGHT and r[i] >= RSI_OVERBOUGHT:
+                marks.append({"x": x, "t": "rsi", "d": "down"})
+            elif r[i - 1] > RSI_OVERSOLD and r[i] <= RSI_OVERSOLD:
+                marks.append({"x": x, "t": "rsi", "d": "up"})
+        if atr_val and i >= RAPID_BARS + 1:
+            def _rap(j):
+                b = closes[j - RAPID_BARS]
+                if not b:
+                    return 0
+                m2 = closes[j] - b
+                if abs(m2) >= RAPID_ATR_MULT * atr_val and abs(m2 / b * 100) >= RAPID_PCT_MIN:
+                    return 1 if m2 > 0 else -1
+                return 0
+            cur = _rap(i)
+            if cur and cur != _rap(i - 1):   # len zaciatok pohybu
+                marks.append({"x": x, "t": "rapid", "d": "up" if cur > 0 else "down"})
+
     return {"name": name, "price": round(last, 2), "rsi": round(rsi_v),
             "trend": trend, "atr_pct": round(atr_pct, 2), "chg_pct": round(chg, 2),
             "dist_high": round(dist_high, 2), "dist_low": round(dist_low, 2),
-            "status": status}
+            "status": status,
+            "c": c_w, "ef": ef_w, "es": es_w, "rsi_s": rsi_w, "marks": marks}
 
 
 def publish_dashboard(items):

@@ -734,8 +734,8 @@ def enrich_recent(state, items, limit=40):
     for e, signed in eval_today(state, items):
         ee = dict(e)
         if signed is not None:
-            ee["res_pct"] = signed
-            ee["ok"] = signed > 0
+            ee["res_pct"] = float(signed)
+            ee["ok"] = bool(signed > 0)
         res.append(ee)
     return res[-limit:][::-1]
 

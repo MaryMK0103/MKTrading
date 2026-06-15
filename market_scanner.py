@@ -740,6 +740,45 @@ def enrich_recent(state, items, limit=40):
     return res[-limit:][::-1]
 
 
+TYPE_LABEL = {
+    "rapid": "rýchly", "trend_up": "trend ▲", "trend_down": "trend ▼",
+    "breakout_up": "breakout ▲", "breakout_down": "breakout ▼",
+    "rsi_overbought": "RSI prekúp.", "rsi_oversold": "RSI prepred.",
+    "daily": "denný pohyb",
+}
+
+def _tl(typ):
+    return TYPE_LABEL.get(typ, typ)
+
+
+def daily_eval_text(res):
+    """Podrobne koncodnove vyhodnotenie: co vyslo a co nie."""
+    evaluable = [(e, s) for e, s in res if s is not None]
+    n = len(res)
+    lines = ["📅 <b>Koniec dňa — vyhodnotenie</b>", f"Signálov dnes: {n}"]
+    if not evaluable:
+        lines.append("dnes žiadne (vyhodnotiteľné) signály")
+        return "\n".join(lines)
+    ok = sorted([(e, s) for e, s in evaluable if s > 0], key=lambda x: -x[1])
+    bad = sorted([(e, s) for e, s in evaluable if s <= 0], key=lambda x: x[1])
+    avg = sum(s for _, s in evaluable) / len(evaluable)
+    lines.append(f"V správnom smere: {len(ok)}/{len(evaluable)} "
+                 f"({len(ok)/len(evaluable)*100:.0f} %), priemer {avg:+.2f} %")
+    if ok:
+        lines.append(f"\n✅ <b>Vyšli ({len(ok)}):</b>")
+        for e, s in ok[:12]:
+            lines.append(f"• {e['name']} {_tl(e['typ'])} {s:+.2f} %")
+    if bad:
+        lines.append(f"\n❌ <b>Nevyšli ({len(bad)}):</b>")
+        for e, s in bad[:12]:
+            lines.append(f"• {e['name']} {_tl(e['typ'])} {s:+.2f} %")
+    na = n - len(evaluable)
+    if na:
+        lines.append(f"\n({na} sa nedalo vyhodnotiť)")
+    lines.append("\nℹ pohyb v smere signálu odvtedy (orientačné, nie reálny obchod)")
+    return "\n".join(lines)
+
+
 def summary_text(res, title):
     evaluable = [(e, s) for e, s in res if s is not None]
     n = len(res)
@@ -783,7 +822,7 @@ def maybe_daily_eval(state, items):
     if state.get("daily_eval_sent") == key:
         return
     state["daily_eval_sent"] = key
-    send_telegram(summary_text(eval_today(state, items), "📅 Koniec dňa — vyhodnotenie"))
+    send_telegram(daily_eval_text(eval_today(state, items)))
 
 
 def build_snapshot_item(name, closes, highs, lows, atr_val):

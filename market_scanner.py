@@ -136,6 +136,20 @@ FOMC_DATES = {
     "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09",
 }
 
+# --- Signal "velky denny pohyb" ---
+ENABLE_DAILY_MOVE = True
+DAILY_MOVE_PCT    = 1.0       # alert ak je trh +-tolko % za den (vs predosly close)
+
+# --- Denik signalov + tyzdenny suhrn ---
+ENABLE_SIGNAL_LOG    = True
+SIGNAL_LOG_MAX       = 300     # kolko poslednych signalov drzat
+ENABLE_WEEKLY_SUMMARY = True
+WEEKLY_DAY  = 0               # 0=pondelok ... 6=nedela
+WEEKLY_HOUR = 8              # hodina suhrnu (lokalny cas QUIET_TZ)
+
+# --- Scan na poziadanie cez Telegram (napis "scan") ---
+ENABLE_SCAN_COMMAND = True
+
 
 # ============================================================
 #  TELEGRAM
@@ -582,6 +596,114 @@ def fetch(ticker):
         return None
 
 
+def _local_now():
+    try:
+        from zoneinfo import ZoneInfo
+        return dt.datetime.now(ZoneInfo(QUIET_TZ))
+    except Exception:
+        return dt.datetime.now()
+
+
+def daily_change(df):
+    """Zmena ceny za den (vs posledny close predosleho dna). Vrati (chg%, datum) alebo None."""
+    closes = list(df["Close"].dropna().values)
+    try:
+        dates = [t.date() for t in df.index]
+    except Exception:
+        return None
+    if not closes or not dates:
+        return None
+    last_date = dates[-1]
+    prev = [closes[i] for i in range(len(closes)) if dates[i] != last_date]
+    if not prev or not prev[-1]:
+        return None
+    return (closes[-1] - prev[-1]) / prev[-1] * 100.0, last_date.isoformat()
+
+
+def append_log(state, entry):
+    if not ENABLE_SIGNAL_LOG:
+        return
+    log = state.get("log", [])
+    log.append(entry)
+    if len(log) > SIGNAL_LOG_MAX:
+        log = log[-SIGNAL_LOG_MAX:]
+    state["log"] = log
+
+
+def log_signal(state, name, typ, d, price, strength):
+    now = _local_now()
+    append_log(state, {"ts": time.time(), "date": now.strftime("%Y-%m-%d"),
+                       "time": now.strftime("%H:%M"), "name": name, "typ": typ,
+                       "dir": d, "price": round(float(price), 2), "str": strength})
+
+
+def build_snapshot_text(items):
+    """Kompaktny textovy prehlad vsetkych trhov (pre 'scan' prikaz)."""
+    order = {"green": 0, "orange": 1, "gray": 2}
+    its = sorted(items, key=lambda x: (order.get(x["status"], 3), -abs(x["chg_pct"])))
+    dots = {"green": "🟢", "orange": "🟠", "gray": "⚪"}
+    lines = ["📊 <b>Prehľad trhov</b>"]
+    for it in its:
+        d = dots.get(it["status"], "⚪")
+        arr = "▲" if it["trend"] == "up" else "▼"
+        lines.append(f"{d} <b>{it['name']}</b> {it['price']} {arr} "
+                     f"{it['chg_pct']:+.2f}% · RSI {it['rsi']}")
+    lines.append("⏱ " + _local_now().strftime("%H:%M"))
+    return "\n".join(lines)
+
+
+def telegram_get_updates(offset):
+    if not TELEGRAM_BOT_TOKEN:
+        return []
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                         params={"offset": offset, "timeout": 0}, timeout=15)
+        return r.json().get("result", [])
+    except Exception as e:
+        print(f"!! getUpdates chyba: {e}")
+        return []
+
+
+def handle_scan_command(state, items):
+    """Ak pouzivatel napisal 'scan', posle prehlad trhov."""
+    if not ENABLE_SCAN_COMMAND:
+        return
+    updates = telegram_get_updates(state.get("tg_offset", 0))
+    triggered = False
+    for u in updates:
+        state["tg_offset"] = u["update_id"] + 1
+        msg = u.get("message") or {}
+        txt = (msg.get("text") or "").strip().lower()
+        if txt in ("scan", "prehlad", "prehľad", "/scan"):
+            triggered = True
+    if triggered and items:
+        send_telegram(build_snapshot_text(items))
+
+
+def maybe_weekly_summary(state):
+    if not ENABLE_WEEKLY_SUMMARY:
+        return
+    now = _local_now()
+    if now.weekday() != WEEKLY_DAY or now.hour < WEEKLY_HOUR:
+        return
+    wk = now.strftime("%G-W%V")
+    if state.get("weekly_sent") == wk:
+        return
+    from collections import Counter
+    cutoff = time.time() - 7 * 86400
+    week = [e for e in state.get("log", []) if e.get("ts", 0) >= cutoff]
+    by_type = Counter(e["typ"] for e in week)
+    by_name = Counter(e["name"] for e in week)
+    lines = ["📒 <b>Týždenný súhrn signálov</b>",
+             f"Spolu: {len(week)} signálov za 7 dní"]
+    if by_type:
+        lines.append("Podľa typu: " + ", ".join(f"{t} {c}×" for t, c in by_type.most_common()))
+    if by_name:
+        lines.append("Najaktívnejšie: " + ", ".join(f"{n} {c}×" for n, c in by_name.most_common(3)))
+    send_telegram("\n".join(lines))
+    state["weekly_sent"] = wk
+
+
 def build_snapshot_item(name, closes, highs, lows, atr_val):
     """Prehlad jedneho trhu pre dashboard."""
     last = closes[-1]
@@ -648,14 +770,14 @@ def build_snapshot_item(name, closes, highs, lows, atr_val):
             "c": c_w, "ef": ef_w, "es": es_w, "rsi_s": rsi_w, "marks": marks}
 
 
-def publish_dashboard(items):
+def publish_dashboard(items, recent=None):
     """Zapise prehlad do verejneho Gistu (ak su nastavene GIST_TOKEN a GIST_ID)."""
     token = os.environ.get("GIST_TOKEN", "")
     gid = os.environ.get("GIST_ID", "")
     if not (token and gid):
         return
     payload = {"updated": dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
-               "items": items}
+               "items": items, "signals": recent or []}
     try:
         r = requests.patch(
             f"https://api.github.com/gists/{gid}",
@@ -684,6 +806,23 @@ def scan_once(state):
 
         if len(closes) >= BREAKOUT_LOOKBACK + 2:
             items.append(build_snapshot_item(name, closes, highs, lows, atr_val))
+
+        # --- velky denny pohyb (raz denne na trh) ---
+        if ENABLE_DAILY_MOVE and len(closes) > RAPID_BARS:
+            dm = daily_change(df)
+            if dm and abs(dm[0]) >= DAILY_MOVE_PCT:
+                chg_d, dkey = dm
+                k = f"daily|{name}|{dkey}"
+                if not state.get(k):
+                    state[k] = True
+                    dd = "up" if chg_d > 0 else "down"
+                    sip = "📈" if dd == "up" else "📉"
+                    dmsg = (f"{sip} <b>VEĽKÝ DENNÝ POHYB</b> {name}: {chg_d:+.2f}% za deň "
+                            f"(cena {closes[-1]:.2f})")
+                    print("[SIGNAL] " + dmsg)
+                    send_telegram(dmsg)
+                    log_signal(state, name, "daily", dd, closes[-1], "blue")
+                    found += 1
 
         sigs = detect_signals(name, df, atr_val)
         if not sigs:
@@ -749,8 +888,18 @@ def scan_once(state):
         chart = make_chart(name, df) if SEND_CHART else None
         if not (chart and send_telegram_photo(chart, text)):
             send_telegram(text)
+        for s in fresh:
+            stg = ("green" if (conf_dir and s["dir"] == conf_dir)
+                   else ("orange" if s["typ"].startswith("rsi") else "red"))
+            log_signal(state, name, s["typ"], s["dir"], closes[-1], stg)
         found += len(fresh)
-    publish_dashboard(items)
+
+    # interaktivita + suhrn + dashboard
+    handle_scan_command(state, items)
+    maybe_weekly_summary(state)
+    today = _local_now().strftime("%Y-%m-%d")
+    recent = [e for e in state.get("log", []) if e.get("date") == today][-40:][::-1]
+    publish_dashboard(items, recent)
     return found
 
 

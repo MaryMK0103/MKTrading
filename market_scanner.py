@@ -150,6 +150,11 @@ WEEKLY_HOUR = 8              # hodina suhrnu (lokalny cas QUIET_TZ)
 # --- Scan na poziadanie cez Telegram (napis "scan") ---
 ENABLE_SCAN_COMMAND = True
 
+# --- Priebezne vyhodnocovanie dnesnych signalov ---
+ENABLE_HOURLY_EVAL = True     # kazdu hodinu suhrn (ako si dnesne signaly vedu)
+ENABLE_DAILY_EVAL  = True     # vyhodnotenie na konci dna
+DAILY_EVAL_HOUR    = 22       # hodina denneho vyhodnotenia (lokalny cas)
+
 
 # ============================================================
 #  TELEGRAM
@@ -704,6 +709,83 @@ def maybe_weekly_summary(state):
     state["weekly_sent"] = wk
 
 
+def eval_today(state, items):
+    """Pre kazdy dnesny signal: o kolko % sa cena pohla v PREDIKOVANOM smere odvtedy.
+    Vrati zoznam (zaznam, signed_pct alebo None ak nemame aktualnu cenu)."""
+    price_map = {it["name"]: it["price"] for it in items}
+    today = _local_now().strftime("%Y-%m-%d")
+    out = []
+    for e in state.get("log", []):
+        if e.get("date") != today:
+            continue
+        cur = price_map.get(e["name"])
+        if cur is None or not e.get("price"):
+            out.append((e, None))
+            continue
+        move = (cur - e["price"]) / e["price"] * 100.0
+        signed = move if e["dir"] == "up" else -move
+        out.append((e, round(signed, 2)))
+    return out
+
+
+def enrich_recent(state, items, limit=40):
+    """Dnesne signaly s priebeznym vysledkom pre dashboard (najnovsie hore)."""
+    res = []
+    for e, signed in eval_today(state, items):
+        ee = dict(e)
+        if signed is not None:
+            ee["res_pct"] = signed
+            ee["ok"] = signed > 0
+        res.append(ee)
+    return res[-limit:][::-1]
+
+
+def summary_text(res, title):
+    evaluable = [(e, s) for e, s in res if s is not None]
+    n = len(res)
+    lines = [f"<b>{title}</b>", f"Signálov dnes: {n}"]
+    if evaluable:
+        ok = sum(1 for _, s in evaluable if s > 0)
+        avg = sum(s for _, s in evaluable) / len(evaluable)
+        lines.append(f"V správnom smere: {ok}/{len(evaluable)} "
+                     f"({ok/len(evaluable)*100:.0f} %), priemer {avg:+.2f} %")
+        best = max(evaluable, key=lambda x: x[1])
+        worst = min(evaluable, key=lambda x: x[1])
+        lines.append(f"Najlepší: {best[0]['name']} ({best[0]['typ']}) {best[1]:+.2f} %")
+        lines.append(f"Najhorší: {worst[0]['name']} ({worst[0]['typ']}) {worst[1]:+.2f} %")
+    elif n == 0:
+        lines.append("dnes žiadne signály")
+    lines.append("ℹ pohyb v smere signálu odvtedy (orientačné, nie reálny obchod)")
+    return "\n".join(lines)
+
+
+def maybe_hourly_eval(state, items):
+    if not ENABLE_HOURLY_EVAL or in_quiet_hours():
+        return
+    now = _local_now()
+    key = now.strftime("%Y-%m-%d-%H")
+    if state.get("hourly_sent") == key:
+        return
+    res = eval_today(state, items)
+    if not res:          # ziadne dnesne signaly -> ticho
+        return
+    state["hourly_sent"] = key
+    send_telegram(summary_text(res, "⏱ Hodinové vyhodnotenie"))
+
+
+def maybe_daily_eval(state, items):
+    if not ENABLE_DAILY_EVAL:
+        return
+    now = _local_now()
+    if now.hour < DAILY_EVAL_HOUR:
+        return
+    key = now.strftime("%Y-%m-%d")
+    if state.get("daily_eval_sent") == key:
+        return
+    state["daily_eval_sent"] = key
+    send_telegram(summary_text(eval_today(state, items), "📅 Koniec dňa — vyhodnotenie"))
+
+
 def build_snapshot_item(name, closes, highs, lows, atr_val):
     """Prehlad jedneho trhu pre dashboard."""
     last = closes[-1]
@@ -777,6 +859,7 @@ def publish_dashboard(items, recent=None):
     if not (token and gid):
         return
     payload = {"updated": dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+               "updated_ts": int(time.time()),
                "items": items, "signals": recent or []}
     try:
         r = requests.patch(
@@ -894,12 +977,12 @@ def scan_once(state):
             log_signal(state, name, s["typ"], s["dir"], closes[-1], stg)
         found += len(fresh)
 
-    # interaktivita + suhrn + dashboard
+    # interaktivita + vyhodnotenie + suhrn + dashboard
     handle_scan_command(state, items)
+    maybe_hourly_eval(state, items)
+    maybe_daily_eval(state, items)
     maybe_weekly_summary(state)
-    today = _local_now().strftime("%Y-%m-%d")
-    recent = [e for e in state.get("log", []) if e.get("date") == today][-40:][::-1]
-    publish_dashboard(items, recent)
+    publish_dashboard(items, enrich_recent(state, items))
     return found
 
 

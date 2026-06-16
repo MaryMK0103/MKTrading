@@ -135,6 +135,17 @@ FOMC_DATES = {
     "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17",
     "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09",
 }
+# CPI - inflacia USA (08:30 ET) - oficialny harmonogram BLS 2026
+CPI_DATES = {
+    "2026-01-13", "2026-02-13", "2026-03-11", "2026-04-10", "2026-05-12",
+    "2026-06-10", "2026-07-14", "2026-08-12", "2026-09-11", "2026-10-14",
+    "2026-11-10", "2026-12-10",
+}
+# ECB - rozhodnutie o sadzbach (14:15 CET = ~08:15 ET) - 2026
+ECB_DATES = {
+    "2026-03-19", "2026-04-30", "2026-06-11", "2026-07-23",
+    "2026-09-10", "2026-10-29", "2026-12-17",
+}
 
 # --- Signal "velky denny pohyb" ---
 ENABLE_DAILY_MOVE = True
@@ -541,7 +552,12 @@ def todays_events():
         mk(10, 30, "Zasoby plynu (EIA, tyzdenne)", {"NatGas"})
     if wd == 4 and d.day <= 7:   # prvy piatok v mesiaci
         mk(8, 30, "NFP - trh prace USA", "all")
-    if d.isoformat() in FOMC_DATES:
+    iso = d.isoformat()
+    if iso in CPI_DATES:
+        mk(8, 30, "CPI - inflacia USA", "all")
+    if iso in ECB_DATES:
+        mk(8, 15, "ECB - rozhodnutie o sadzbach", "all")   # 14:15 CET
+    if iso in FOMC_DATES:
         mk(14, 0, "FOMC - rozhodnutie Fed o sadzbach", "all")
     return evs
 

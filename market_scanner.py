@@ -812,6 +812,94 @@ def maybe_hourly_eval(state, items):
     send_telegram(summary_text(res, "⏱ Hodinové vyhodnotenie"))
 
 
+FAIL_REASON = {
+    "breakout_up": "Falošné prerazenie hore — cena sa vrátila pod úroveň (pílový/bočný trh).",
+    "breakout_down": "Falošné prerazenie dole — cena sa vrátila nad úroveň.",
+    "rapid": "Prudký pohyb sa vrátil späť (mean reversion) — chýbalo pokračovanie.",
+    "trend_up": "Kríženie EMA hore bez pokračovania — slabý alebo bočný trend.",
+    "trend_down": "Kríženie EMA dole bez pokračovania — slabý alebo bočný trend.",
+    "rsi_overbought": "RSI prekúpené, ale cena ďalej rástla namiesto obratu (silný trend).",
+    "rsi_oversold": "RSI prepredané, ale cena ďalej klesala namiesto obratu (silný trend).",
+    "daily": "Denný pohyb sa počas dňa otočil.",
+}
+
+
+def build_day_report(state, items):
+    """Zostavi strukturovany denny report (vratane rozboru preco signaly nevysli)."""
+    from collections import Counter
+    res = eval_today(state, items)
+    today = _local_now().strftime("%Y-%m-%d")
+    evaluable = [(e, s) for e, s in res if s is not None]
+    ok = [(e, s) for e, s in evaluable if s > 0]
+    bad = [(e, s) for e, s in evaluable if s <= 0]
+    avg = sum(s for _, s in evaluable) / len(evaluable) if evaluable else 0.0
+    hit = round(len(ok) / len(evaluable) * 100) if evaluable else None
+
+    # rozbor preco nevyslo
+    analysis = []
+    fail_types = Counter(e["typ"] for e, _ in bad)
+    if bad:
+        top_t, top_c = fail_types.most_common(1)[0]
+        if top_c >= 2 and top_c >= len(bad) * 0.5:
+            analysis.append(f"Najviac zlyhali: {_tl(top_t)} ({top_c}×) — naznačuje "
+                            f"{'bočný/pílový trh' if 'breakout' in top_t or 'rapid' in top_t else 'slabé pokračovanie'}.")
+    for t, c in fail_types.most_common():
+        analysis.append(f"{_tl(t)} ({c}×): {FAIL_REASON.get(t, 'cena nešla v predikovanom smere.')}")
+    if not bad and evaluable:
+        analysis.append("Dnes nezlyhal žiadny vyhodnotiteľný signál. 👍")
+
+    sigs = []
+    for e, s in res:
+        sigs.append({"time": e.get("time"), "name": e.get("name"), "typ": e.get("typ"),
+                     "dir": e.get("dir"), "price": e.get("price"), "str": e.get("str"),
+                     "res_pct": (float(s) if s is not None else None)})
+    return {"date": today, "total": len(res), "ok": len(ok), "bad": len(bad),
+            "na": len(res) - len(evaluable), "hitrate": hit, "avg": round(avg, 2),
+            "analysis": analysis, "signals": sigs}
+
+
+def report_telegram_text(rep):
+    lines = ["📅 <b>Report dňa — " + rep["date"] + "</b>",
+             f"Signálov: {rep['total']} · vyšli {rep['ok']} · nevyšli {rep['bad']}"]
+    if rep["hitrate"] is not None:
+        lines.append(f"Úspešnosť: {rep['hitrate']} % · priemer {rep['avg']:+.2f} %")
+    if rep["analysis"]:
+        lines.append("\n🔎 <b>Prečo nevyšlo:</b>")
+        for a in rep["analysis"][:6]:
+            lines.append("• " + a)
+    lines.append("\nℹ orientačné (pohyb v smere signálu), nie reálny obchod")
+    return "\n".join(lines)
+
+
+def save_report_to_gist(report):
+    """Ulozi denny report do gistu reports.json (archiv, posledných 60 dni)."""
+    token = os.environ.get("GIST_TOKEN", "")
+    gid = os.environ.get("GIST_ID", "")
+    if not (token and gid):
+        return
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+    archive = []
+    try:
+        r = requests.get(f"https://api.github.com/gists/{gid}", headers=headers, timeout=20)
+        f = r.json().get("files", {}).get("reports.json")
+        if f:
+            content = f.get("content", "[]")
+            if f.get("truncated") and f.get("raw_url"):
+                content = requests.get(f["raw_url"], timeout=20).text
+            archive = json.loads(content or "[]")
+    except Exception as e:
+        print(f"!! citanie reports.json: {e}")
+    archive = [a for a in archive if a.get("date") != report["date"]]
+    archive.insert(0, report)
+    archive = archive[:60]
+    try:
+        requests.patch(f"https://api.github.com/gists/{gid}", headers=headers,
+                       json={"files": {"reports.json": {"content": json.dumps(archive, ensure_ascii=False)}}},
+                       timeout=20)
+    except Exception as e:
+        print(f"!! zapis reports.json: {e}")
+
+
 def maybe_daily_eval(state, items):
     if not ENABLE_DAILY_EVAL:
         return
@@ -822,7 +910,9 @@ def maybe_daily_eval(state, items):
     if state.get("daily_eval_sent") == key:
         return
     state["daily_eval_sent"] = key
-    send_telegram(daily_eval_text(eval_today(state, items)))
+    report = build_day_report(state, items)
+    send_telegram(report_telegram_text(report))
+    save_report_to_gist(report)
 
 
 def build_snapshot_item(name, closes, highs, lows, atr_val):

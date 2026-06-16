@@ -1006,6 +1006,7 @@ def publish_dashboard(items, recent=None):
 def scan_once(state):
     found = 0
     now_ts = time.time()
+    quiet = in_quiet_hours()   # v tichych hodinach len neposielame na Telegram, dashboard ide dalej
     items = []
     for name, ticker in INSTRUMENTS.items():
         df = fetch(ticker)
@@ -1032,7 +1033,8 @@ def scan_once(state):
                     dmsg = (f"{sip} <b>VEĽKÝ DENNÝ POHYB</b> {name}: {chg_d:+.2f}% za deň "
                             f"(cena {closes[-1]:.2f})")
                     print("[SIGNAL] " + dmsg)
-                    send_telegram(dmsg)
+                    if not quiet:
+                        send_telegram(dmsg)
                     log_signal(state, name, "daily", dd, closes[-1], "blue")
                     found += 1
 
@@ -1097,9 +1099,10 @@ def scan_once(state):
         for s in fresh:
             print(f"[SIGNAL] {s['sprava']}")
 
-        chart = make_chart(name, df) if SEND_CHART else None
-        if not (chart and send_telegram_photo(chart, text)):
-            send_telegram(text)
+        if not quiet:
+            chart = make_chart(name, df) if SEND_CHART else None
+            if not (chart and send_telegram_photo(chart, text)):
+                send_telegram(text)
         for s in fresh:
             stg = ("green" if (conf_dir and s["dir"] == conf_dir)
                    else ("orange" if s["typ"].startswith("rsi") else "red"))
@@ -1143,10 +1146,8 @@ def main():
     print(f" Sviecka: {INTERVAL} | HTF filter: {ENABLE_HTF_FILTER} | "
           f"AI: {bool(AI_API_KEY)} | confluence_only: {CONFLUENCE_ONLY}")
     print("=" * 60)
-
-    if in_quiet_hours():
-        print("[QUIET] tiche hodiny - sken sa neposiela.")
-        return
+    # POZN: sken bezi VZDY (aj v tichych hodinach) - dashboard sa aktualizuje 24/7.
+    # V tichych hodinach (23:00-07:00) sa len NEPOSIELA na Telegram (riesi scan_once).
 
     state = load_state()
 
@@ -1160,11 +1161,10 @@ def main():
     send_telegram("✅ Skener trhu v2 spusteny a sleduje trh.")
     while True:
         try:
-            if not in_quiet_hours():
-                maybe_send_morning_brief(state)
-                n = scan_once(state)
-                save_state(state)
-                print(f"[{dt.datetime.now():%H:%M:%S}] sken hotovy, signalov: {n}")
+            maybe_send_morning_brief(state)
+            n = scan_once(state)
+            save_state(state)
+            print(f"[{dt.datetime.now():%H:%M:%S}] sken hotovy, signalov: {n}")
         except KeyboardInterrupt:
             print("\nUkoncene pouzivatelom."); break
         except Exception as e:

@@ -911,8 +911,10 @@ def maybe_daily_eval(state, items):
         return
     state["daily_eval_sent"] = key
     report = build_day_report(state, items)
+    arch = state.get("archive")
+    if arch and report["date"] in arch:
+        arch[report["date"]]["analysis"] = report["analysis"]
     send_telegram(report_telegram_text(report))
-    save_report_to_gist(report)
 
 
 def build_snapshot_item(name, closes, highs, lows, atr_val):
@@ -981,8 +983,8 @@ def build_snapshot_item(name, closes, highs, lows, atr_val):
             "c": c_w, "ef": ef_w, "es": es_w, "rsi_s": rsi_w, "marks": marks}
 
 
-def publish_dashboard(items, recent=None):
-    """Zapise prehlad do verejneho Gistu (ak su nastavene GIST_TOKEN a GIST_ID)."""
+def publish_dashboard(items, recent=None, archive=None):
+    """Zapise dashboard.json (live) + reports.json (archiv po dnoch) do Gistu."""
     token = os.environ.get("GIST_TOKEN", "")
     gid = os.environ.get("GIST_ID", "")
     if not (token and gid):
@@ -990,13 +992,15 @@ def publish_dashboard(items, recent=None):
     payload = {"updated": dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
                "updated_ts": int(time.time()),
                "items": items, "signals": recent or []}
+    files = {"dashboard.json": {"content": json.dumps(payload, ensure_ascii=False)}}
+    if archive is not None:
+        files["reports.json"] = {"content": json.dumps(archive, ensure_ascii=False)}
     try:
         r = requests.patch(
             f"https://api.github.com/gists/{gid}",
             headers={"Authorization": f"token {token}",
                      "Accept": "application/vnd.github+json"},
-            json={"files": {"dashboard.json": {"content": json.dumps(payload, ensure_ascii=False)}}},
-            timeout=20)
+            json={"files": files}, timeout=25)
         if r.status_code not in (200, 201):
             print(f"!! Gist update {r.status_code}: {r.text[:200]}")
     except Exception as e:
@@ -1109,12 +1113,32 @@ def scan_once(state):
             log_signal(state, name, s["typ"], s["dir"], closes[-1], stg)
         found += len(fresh)
 
-    # interaktivita + vyhodnotenie + suhrn + dashboard
+    # interaktivita + vyhodnotenie
     handle_scan_command(state, items)
     maybe_hourly_eval(state, items)
-    maybe_daily_eval(state, items)
     maybe_weekly_summary(state)
-    publish_dashboard(items, enrich_recent(state, items))
+
+    # --- trvaly archiv signalov po dnoch (dnesok live, minule dni zmrazene) ---
+    recent = enrich_recent(state, items)
+    today = _local_now().strftime("%Y-%m-%d")
+    arch = state.get("archive", {})
+    res = eval_today(state, items)
+    ev = [s for _, s in res if s is not None]
+    okc = sum(1 for s in ev if s > 0)
+    prev = arch.get(today, {})
+    arch[today] = {"date": today, "signals": recent, "total": len(res),
+                   "ok": okc, "bad": len(ev) - okc, "na": len(res) - len(ev),
+                   "hitrate": round(okc / len(ev) * 100) if ev else None,
+                   "avg": round(sum(ev) / len(ev), 2) if ev else 0.0,
+                   "analysis": prev.get("analysis", [])}
+    for d in sorted(arch.keys())[:-60]:       # drz poslednych 60 dni
+        arch.pop(d, None)
+    state["archive"] = arch
+
+    maybe_daily_eval(state, items)            # o 22:00 doplni rozbor do dnesneho zaznamu
+
+    archive_list = [arch[d] for d in sorted(arch.keys(), reverse=True)]
+    publish_dashboard(items, recent, archive_list)
     return found
 
 

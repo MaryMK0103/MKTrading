@@ -1131,6 +1131,18 @@ def scan_once(state):
                    "hitrate": round(okc / len(ev) * 100) if ev else None,
                    "avg": round(sum(ev) / len(ev), 2) if ev else 0.0,
                    "analysis": prev.get("analysis", [])}
+    # spatne doplnenie minulych dni z pamate (log) - ak v archive este nie su
+    bydate = {}
+    for e in state.get("log", []):
+        bydate.setdefault(e.get("date", "?"), []).append(e)
+    for d, entries in bydate.items():
+        if d == today or d in arch or d == "?":
+            continue
+        sigs = [{"time": e.get("time"), "name": e.get("name"), "typ": e.get("typ"),
+                 "dir": e.get("dir"), "price": e.get("price"), "str": e.get("str"),
+                 "res_pct": None} for e in entries]
+        arch[d] = {"date": d, "signals": sigs, "total": len(sigs), "ok": 0, "bad": 0,
+                   "na": len(sigs), "hitrate": None, "avg": 0.0, "analysis": []}
     for d in sorted(arch.keys())[:-60]:       # drz poslednych 60 dni
         arch.pop(d, None)
     state["archive"] = arch

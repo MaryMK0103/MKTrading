@@ -150,6 +150,15 @@ WEEKLY_HOUR = 8              # hodina suhrnu (lokalny cas QUIET_TZ)
 # --- Scan na poziadanie cez Telegram (napis "scan") ---
 ENABLE_SCAN_COMMAND = True
 
+# --- "PRO" rozsirenia (kvalitna brana ako u profi traderov) ---
+ENABLE_PRO        = True
+LEVEL_TOL_ATR     = 0.6     # "na urovni" ak je cena do tolkonasobku ATR od kluc. urovne
+RR_GATE           = True    # filtrovat signaly s prilis malym pomerom zisk:riziko
+MIN_RR            = 1.6     # minimalny pomer zisk:riziko (ciel = najblizsia uroven)
+SUPPRESS_RANGE    = True    # v bocnom/pilovom trhu nepustat breakout/rapid
+RANGE_TREND_PCT   = 0.10    # |EMA9-EMA21|/cena pod tolko % => bocny trh
+NEWS_BLACKOUT_MIN = 20      # tolko minut pred velkou udalostou nevstupovat
+
 # --- Priebezne vyhodnocovanie dnesnych signalov ---
 ENABLE_HOURLY_EVAL = True     # kazdu hodinu suhrn (ako si dnesne signaly vedu)
 ENABLE_DAILY_EVAL  = True     # vyhodnotenie na konci dna
@@ -1007,6 +1016,128 @@ def publish_dashboard(items, recent=None, archive=None):
         print(f"!! Gist update chyba: {e}")
 
 
+def _prev_day_hl(df):
+    try:
+        dates = [t.date() for t in df.index]
+    except Exception:
+        return None, None
+    if not dates:
+        return None, None
+    last = dates[-1]
+    hi = df["High"].values
+    lo = df["Low"].values
+    idx = [i for i in range(len(dates)) if dates[i] != last]
+    if not idx:
+        return None, None
+    return float(max(hi[i] for i in idx)), float(min(lo[i] for i in idx))
+
+
+def _round_levels(price):
+    if price <= 0:
+        return []
+    mag = 10 ** math.floor(math.log10(price))
+    step = mag / 10.0
+    base = round(price / step) * step
+    return [(round(base, 4), "okrúhle"), (round(base + step, 4), "okrúhle"),
+            (round(base - step, 4), "okrúhle")]
+
+
+def key_levels(name, df, closes, highs, lows):
+    levels = []
+    ph, pl = _prev_day_hl(df)
+    if ph:
+        levels.append((ph, "včerajšie max"))
+    if pl:
+        levels.append((pl, "včerajšie min"))
+    if len(highs) > BREAKOUT_LOOKBACK + 2:
+        levels.append((float(max(highs[-1 - BREAKOUT_LOOKBACK:-1])), "lokálne max"))
+        levels.append((float(min(lows[-1 - BREAKOUT_LOOKBACK:-1])), "lokálne min"))
+    levels += _round_levels(closes[-1])
+    return levels
+
+
+def nearest_level(price, levels, tol):
+    best = None
+    for lv, lbl in levels:
+        d = abs(price - lv)
+        if d <= tol and (best is None or d < best[2]):
+            best = (lv, lbl, d)
+    return best
+
+
+def rr_to_target(direction, entry, risk_dist, levels):
+    """Pomer zisk:riziko, kde ciel = najblizsia kluc. uroven v smere obchodu."""
+    if risk_dist <= 0:
+        return None
+    buf = risk_dist * 0.2
+    if direction == "up":
+        ups = [lv for lv, _ in levels if lv > entry + buf]
+        if not ups:
+            return None
+        tgt = min(ups)
+        reward = tgt - entry
+    else:
+        dns = [lv for lv, _ in levels if lv < entry - buf]
+        if not dns:
+            return None
+        tgt = max(dns)
+        reward = entry - tgt
+    return reward / risk_dist, tgt
+
+
+def market_regime(closes, atr_val):
+    ef = ema(closes, EMA_FAST)
+    es = ema(closes, EMA_SLOW)
+    sep = abs(ef[-1] - es[-1]) / closes[-1] * 100.0 if closes[-1] else 0.0
+    return "trend" if sep >= RANGE_TREND_PCT else "range"
+
+
+def news_blackout(name):
+    if NEWS_BLACKOUT_MIN <= 0 or not ENABLE_CALENDAR:
+        return False
+    try:
+        now = dt.datetime.now(_et_zone())
+        for e in todays_events():
+            delta = (e["when"] - now).total_seconds() / 60.0
+            if -5 <= delta <= NEWS_BLACKOUT_MIN and (e["affects"] == "all" or name in e["affects"]):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def pro_filter(name, df, closes, highs, lows, atr_val, fresh):
+    """Kvalitna brana: uroven + R:R + rezim. Vrati (kept, kontext_text, silny)."""
+    if not ENABLE_PRO or not atr_val:
+        return fresh, "", False
+    levels = key_levels(name, df, closes, highs, lows)
+    reg = market_regime(closes, atr_val)
+    entry = closes[-1]
+    risk_dist = STOP_ATR_MULT * atr_val
+    nl = nearest_level(entry, levels, LEVEL_TOL_ATR * atr_val)
+    kept = []
+    rr0 = None
+    for s in fresh:
+        if SUPPRESS_RANGE and reg == "range" and s["typ"] in ("rapid", "breakout_up", "breakout_down"):
+            continue
+        rr = rr_to_target(s["dir"], entry, risk_dist, levels)
+        if RR_GATE and rr is not None and rr[0] < MIN_RR:
+            continue
+        if rr0 is None:
+            rr0 = rr
+        kept.append(s)
+    if not kept:
+        return [], "", False
+    lines = []
+    if nl:
+        lines.append(f"📍 na úrovni {nl[0]:.2f} ({nl[1]})")
+    if rr0:
+        lines.append(f"🎯 R:R ~{rr0[0]:.1f} (cieľ {rr0[1]:.2f})")
+    lines.append(f"📊 režim: {'trend' if reg == 'trend' else 'bočný'}")
+    strong = bool(nl and reg == "trend" and rr0 and rr0[0] >= MIN_RR)
+    return kept, "\n" + "\n".join(lines), strong
+
+
 def scan_once(state):
     found = 0
     now_ts = time.time()
@@ -1067,6 +1198,13 @@ def scan_once(state):
         if not fresh:
             continue
 
+        # --- PRO brana: news blackout + uroven / R:R / rezim ---
+        if ENABLE_PRO and news_blackout(name):
+            continue
+        fresh, pro_lines, pro_strong = pro_filter(name, df, closes, highs, lows, atr_val, fresh)
+        if not fresh:
+            continue
+
         ts = dt.datetime.now().strftime("%H:%M:%S")
 
         # --- SILA SIGNALU: cervena=slaby, oranzova=stredny (RSI), zelena=zhoda ---
@@ -1077,7 +1215,9 @@ def scan_once(state):
                 return "\U0001F7E0"   # oranzova - strednejsi (RSI ma edge)
             return "\U0001F534"        # cervena - slaby (rapid/breakout/trend)
 
-        if conf_dir:
+        if pro_strong:
+            head = "⭐ <b>SILNÝ SETUP — úroveň + trend + R:R</b>\n"
+        elif conf_dir:
             smer = "HORE" if conf_dir == "up" else "DOLE"
             head = (f"\U0001F7E2 <b>SILNY SIGNAL — ZHODA {smer}</b> "
                     f"({conf_n} signalov sa zhoduje)\n")
@@ -1099,7 +1239,7 @@ def scan_once(state):
         # AI kontext
         ai = ai_context(head + body)
 
-        text = f"{head}{body}{risk}{warn}{ai}{legenda}\n⏱ {ts}"
+        text = f"{head}{body}{risk}{pro_lines}{warn}{ai}{legenda}\n⏱ {ts}"
         for s in fresh:
             print(f"[SIGNAL] {s['sprava']}")
 

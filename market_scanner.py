@@ -159,6 +159,10 @@ SUPPRESS_RANGE    = True    # v bocnom/pilovom trhu nepustat breakout/rapid
 RANGE_TREND_PCT   = 0.10    # |EMA9-EMA21|/cena pod tolko % => bocny trh
 NEWS_BLACKOUT_MIN = 20      # tolko minut pred velkou udalostou nevstupovat
 
+# --- Spatne prehodnotenie minulych dni (dopocita realne vysledky z historie) ---
+ENABLE_REEVAL  = True
+REEVAL_HORIZON = 12         # o kolko sviecok neskor hodnotime vysledok (12 x 5m = 1h)
+
 # --- Priebezne vyhodnocovanie dnesnych signalov ---
 ENABLE_HOURLY_EVAL = True     # kazdu hodinu suhrn (ako si dnesne signaly vedu)
 ENABLE_DAILY_EVAL  = True     # vyhodnotenie na konci dna
@@ -1138,6 +1142,96 @@ def pro_filter(name, df, closes, highs, lows, atr_val, fresh):
     return kept, "\n" + "\n".join(lines), strong
 
 
+def _reeval_day(rep):
+    """Dopocita realne vysledky signalov daneho dna z historickych 5-min dat."""
+    from collections import Counter
+    try:
+        from zoneinfo import ZoneInfo
+        loc = ZoneInfo(QUIET_TZ)
+    except Exception:
+        return
+    date = rep.get("date")
+    series = {}
+    for s in rep.get("signals", []):
+        name = s.get("name")
+        ticker = INSTRUMENTS.get(name)
+        if not ticker:
+            continue
+        if name not in series:
+            try:
+                df = yf.Ticker(ticker).history(period="60d", interval="5m")
+                if df is None or df.empty:
+                    series[name] = None
+                else:
+                    idx = df.index
+                    idx = idx.tz_convert(loc) if idx.tz is not None else idx.tz_localize("UTC").tz_convert(loc)
+                    series[name] = (list(idx.to_pydatetime()), list(df["Close"].values))
+            except Exception as e:
+                print(f"!! reeval fetch {name}: {e}")
+                series[name] = None
+        sr = series.get(name)
+        if not sr:
+            continue
+        times, closes = sr
+        try:
+            hh, mm = (s.get("time") or "00:00").split(":")
+            target = dt.datetime.strptime(date, "%Y-%m-%d").replace(
+                hour=int(hh), minute=int(mm), tzinfo=loc)
+        except Exception:
+            continue
+        besti, bestd = None, None
+        for i, t in enumerate(times):
+            dd = abs((t - target).total_seconds())
+            if bestd is None or dd < bestd:
+                bestd, besti = dd, i
+        if besti is None or bestd > 20 * 60:
+            continue
+        j = besti + REEVAL_HORIZON
+        if j >= len(closes):
+            continue
+        entry, future = closes[besti], closes[j]
+        if not entry:
+            continue
+        move = (future - entry) / entry * 100.0
+        signed = move if s.get("dir") == "up" else -move
+        s["res_pct"] = round(float(signed), 2)
+    # prepocet suhrnu + rozbor
+    ev = [s["res_pct"] for s in rep.get("signals", []) if isinstance(s.get("res_pct"), (int, float))]
+    ok = sum(1 for x in ev if x > 0)
+    rep["ok"] = ok
+    rep["bad"] = len(ev) - ok
+    rep["na"] = len(rep.get("signals", [])) - len(ev)
+    rep["hitrate"] = round(ok / len(ev) * 100) if ev else None
+    rep["avg"] = round(sum(ev) / len(ev), 2) if ev else 0.0
+    bad_types = Counter(s["typ"] for s in rep.get("signals", [])
+                        if isinstance(s.get("res_pct"), (int, float)) and s["res_pct"] <= 0)
+    analysis = []
+    if bad_types:
+        tt, tc = bad_types.most_common(1)[0]
+        if tc >= 2:
+            analysis.append(f"Najviac zlyhali: {_tl(tt)} ({tc}×).")
+    for t, c in bad_types.most_common():
+        analysis.append(f"{_tl(t)} ({c}×): {FAIL_REASON.get(t, 'cena nešla v predikovanom smere.')}")
+    rep["analysis"] = analysis
+    rep["reeval"] = True
+
+
+def maybe_reevaluate(state):
+    if not ENABLE_REEVAL:
+        return
+    arch = state.get("archive", {})
+    today = _local_now().strftime("%Y-%m-%d")
+    pending = [d for d, r in arch.items()
+               if d != today and not r.get("reeval")
+               and any(s.get("res_pct") is None for s in r.get("signals", []))]
+    if not pending:
+        return
+    for d in sorted(pending, reverse=True)[:1]:   # max 1 den za beh (kvoli casu)
+        print(f"[REEVAL] dopocitavam vysledky pre {d}")
+        _reeval_day(arch[d])
+    state["archive"] = arch
+
+
 def scan_once(state):
     found = 0
     now_ts = time.time()
@@ -1288,7 +1382,9 @@ def scan_once(state):
     state["archive"] = arch
 
     maybe_daily_eval(state, items)            # o 22:00 doplni rozbor do dnesneho zaznamu
+    maybe_reevaluate(state)                    # dopocita realne vysledky minulych dni
 
+    arch = state.get("archive", {})
     archive_list = [arch[d] for d in sorted(arch.keys(), reverse=True)]
     publish_dashboard(items, recent, archive_list)
     return found

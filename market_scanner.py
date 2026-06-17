@@ -169,6 +169,8 @@ MIN_RR            = 1.6     # minimalny pomer zisk:riziko (ciel = najblizsia uro
 SUPPRESS_RANGE    = True    # v bocnom/pilovom trhu nepustat breakout/rapid
 RANGE_TREND_PCT   = 0.10    # |EMA9-EMA21|/cena pod tolko % => bocny trh
 NEWS_BLACKOUT_MIN = 20      # tolko minut pred velkou udalostou nevstupovat
+MAX_SIGNALS_PER_DAY = 3     # max signalov na jeden trh za den (proti preobchodovaniu)
+BREAKOUT_NEEDS_CONFL_OR_LEVEL = True   # breakout poslat len pri zhode alebo na kluc. urovni
 
 # --- Spatne prehodnotenie minulych dni (dopocita realne vysledky z historie) ---
 ENABLE_REEVAL  = True
@@ -1127,9 +1129,9 @@ def news_blackout(name):
 
 
 def pro_filter(name, df, closes, highs, lows, atr_val, fresh):
-    """Kvalitna brana: uroven + R:R + rezim. Vrati (kept, kontext_text, silny)."""
+    """Kvalitna brana: uroven + R:R + rezim. Vrati (kept, kontext, silny, na_urovni)."""
     if not ENABLE_PRO or not atr_val:
-        return fresh, "", False
+        return fresh, "", False, False
     levels = key_levels(name, df, closes, highs, lows)
     reg = market_regime(closes, atr_val)
     entry = closes[-1]
@@ -1147,7 +1149,7 @@ def pro_filter(name, df, closes, highs, lows, atr_val, fresh):
             rr0 = rr
         kept.append(s)
     if not kept:
-        return [], "", False
+        return [], "", False, bool(nl)
     lines = []
     if nl:
         lines.append(f"📍 na úrovni {nl[0]:.2f} ({nl[1]})")
@@ -1155,7 +1157,7 @@ def pro_filter(name, df, closes, highs, lows, atr_val, fresh):
         lines.append(f"🎯 R:R ~{rr0[0]:.1f} (cieľ {rr0[1]:.2f})")
     lines.append(f"📊 režim: {'trend' if reg == 'trend' else 'bočný'}")
     strong = bool(nl and reg == "trend" and rr0 and rr0[0] >= MIN_RR)
-    return kept, "\n" + "\n".join(lines), strong
+    return kept, "\n" + "\n".join(lines), strong, bool(nl)
 
 
 def _reeval_day(rep):
@@ -1311,8 +1313,21 @@ def scan_once(state):
         # --- PRO brana: news blackout + uroven / R:R / rezim ---
         if ENABLE_PRO and news_blackout(name):
             continue
-        fresh, pro_lines, pro_strong = pro_filter(name, df, closes, highs, lows, atr_val, fresh)
+        fresh, pro_lines, pro_strong, at_level = pro_filter(name, df, closes, highs, lows, atr_val, fresh)
         if not fresh:
+            continue
+
+        # breakout len pri zhode alebo na kluc. urovni (inak vela falosnych)
+        if BREAKOUT_NEEDS_CONFL_OR_LEVEL:
+            fresh = [s for s in fresh if not (
+                s["typ"].startswith("breakout") and not at_level
+                and not (conf_dir and s["dir"] == conf_dir))]
+            if not fresh:
+                continue
+
+        # strop signalov na trh za den (proti preobchodovaniu)
+        dkey = f"daycount|{name}|{_local_now().strftime('%Y-%m-%d')}"
+        if state.get(dkey, 0) >= MAX_SIGNALS_PER_DAY:
             continue
 
         ts = dt.datetime.now().strftime("%H:%M:%S")
@@ -1361,6 +1376,7 @@ def scan_once(state):
             stg = ("green" if (conf_dir and s["dir"] == conf_dir)
                    else ("orange" if s["typ"].startswith("rsi") else "red"))
             log_signal(state, name, s["typ"], s["dir"], closes[-1], stg)
+        state[dkey] = state.get(dkey, 0) + len(fresh)
         found += len(fresh)
 
     # interaktivita + vyhodnotenie

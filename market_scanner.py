@@ -177,7 +177,7 @@ ENABLE_REEVAL  = True
 REEVAL_HORIZON = 12         # o kolko sviecok neskor hodnotime vysledok (12 x 5m = 1h)
 
 # --- Priebezne vyhodnocovanie dnesnych signalov ---
-ENABLE_HOURLY_EVAL = True     # kazdu hodinu suhrn (ako si dnesne signaly vedu)
+ENABLE_HOURLY_EVAL = False    # hodinovy suhrn vypnuty (vyhodnotenie len 1x denne o 22:00)
 ENABLE_DAILY_EVAL  = True     # vyhodnotenie na konci dna
 DAILY_EVAL_HOUR    = 22       # hodina denneho vyhodnotenia (lokalny cas)
 

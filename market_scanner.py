@@ -94,6 +94,20 @@ HTF_INTERVAL = "1h"
 HTF_PERIOD   = "1mo"
 HTF_EMA      = 50            # smer trendu na 1h podla EMA(50)
 
+# --- Denny trendovy filter (silnejsia ochrana proti protitrendovym vstupom) ---
+# Trendove signaly (trend_up/trend_down) preposle LEN ak su v smere DENNEHO trendu.
+# Toto by bolo zablokovalo katastrofu zo 17.6. (striebro "trend_up" do klesajuceho trhu).
+ENABLE_DAILY_TREND_GATE = True
+DAILY_TREND_PERIOD = "6mo"
+DAILY_TREND_EMA    = 20         # denny trend = poloha + sklon EMA(20) na dennych svieckach
+
+# --- Sprisnene instrumenty (napr. NatGas - extremne mykavy, 0/4 dna 17.6.) ---
+# Tieto trhy posielaju signal LEN pri zhode 2+ signalov (confluence) a maju vyssi
+# prah rychleho pohybu. Tlmi to osamotene, slabe signaly na divokych trhoch.
+STRICT_INSTRUMENTS    = {"NatGas"}
+STRICT_NEED_CONFLUENCE = True   # sprisneny trh: vyzaduj zhodu 2+ signalov
+STRICT_RAPID_ATR_MULT  = 1.7    # sprisneny trh: rychly pohyb musi byt vacsi (menej sumu)
+
 # --- Confluence ---
 # True = posli LEN ked sa zhodnu 2+ signaly rovnakeho smeru.
 # False = posli vsetko, ale zhodu zvyrazni.
@@ -397,11 +411,42 @@ def htf_trend(ticker):
         return None
 
 
+_daily_cache = {}
+
+def daily_trend(ticker):
+    """Denny trend: 'up' ak cena nad EMA20 a EMA20 stupa; 'down' ak pod a klesa; inak None.
+    Vyzaduje zhodu polohy aj sklonu - bezny odraz v klesajucom trhu sa neoznaci ako 'up'."""
+    if not ENABLE_DAILY_TREND_GATE:
+        return None
+    if ticker in _daily_cache:
+        return _daily_cache[ticker]
+    try:
+        df = yf.Ticker(ticker).history(period=DAILY_TREND_PERIOD, interval="1d")
+        closes = list(df["Close"].dropna().values)
+        if len(closes) < DAILY_TREND_EMA + 6:
+            _daily_cache[ticker] = None
+            return None
+        e = ema(closes, DAILY_TREND_EMA)
+        price_up = closes[-1] >= e[-1]
+        slope_up = e[-1] > e[-4]           # EMA stupa za poslednych ~3 dni
+        if price_up and slope_up:
+            t = "up"
+        elif (not price_up) and (not slope_up):
+            t = "down"
+        else:
+            t = None                        # nejasny / bocny denny trend
+        _daily_cache[ticker] = t
+        return t
+    except Exception:
+        _daily_cache[ticker] = None
+        return None
+
+
 # ============================================================
 #  DETEKCIA SIGNALOV
 # ============================================================
 
-def detect_signals(name, df, atr_val):
+def detect_signals(name, df, atr_val, rapid_mult=None):
     signals = []
     closes = list(df["Close"].dropna().values)
     highs  = list(df["High"].dropna().values)
@@ -413,10 +458,11 @@ def detect_signals(name, df, atr_val):
 
     # 1) RYCHLY POHYB (ATR-based)
     if ENABLE_RAPID and atr_val:
+        _rmult = RAPID_ATR_MULT if rapid_mult is None else rapid_mult
         ref = closes[-1 - RAPID_BARS]
         move = last - ref
         pct = (move / ref * 100.0) if ref else 0.0
-        if abs(move) >= RAPID_ATR_MULT * atr_val and abs(pct) >= RAPID_PCT_MIN:
+        if abs(move) >= _rmult * atr_val and abs(pct) >= RAPID_PCT_MIN:
             d = "up" if move > 0 else "down"
             sip = "\U0001F4C8" if d == "up" else "\U0001F4C9"
             smer = "NARAST" if d == "up" else "POKLES"
@@ -469,11 +515,21 @@ def detect_signals(name, df, atr_val):
 
 
 def apply_htf_filter(ticker, signals):
-    """Odstrani signaly proti 1h trendu."""
+    """Odstrani signaly proti 1h trendu + trendove signaly proti DENNEMU trendu."""
     trend = htf_trend(ticker)
-    if trend is None:
-        return signals, None
-    kept = [s for s in signals if s["dir"] == trend]
+    kept = signals if trend is None else [s for s in signals if s["dir"] == trend]
+
+    # Denna brana: trend_up/trend_down musi byt v smere denneho trendu.
+    # Ak denny trend nie je jasny (bocny/None), trendove signaly NEPOSIELAME -
+    # trendovy signal bez nadradeneho trendu je najcastejsi zdroj strat.
+    if ENABLE_DAILY_TREND_GATE:
+        dtr = daily_trend(ticker)
+        def _trend_ok(s):
+            if not s["typ"].startswith("trend"):
+                return True              # rapid/breakout/rsi denna brana neriesi
+            return dtr is not None and s["dir"] == dtr
+        kept = [s for s in kept if _trend_ok(s)]
+
     return kept, trend
 
 
@@ -1285,11 +1341,13 @@ def scan_once(state):
                     log_signal(state, name, "daily", dd, closes[-1], "blue")
                     found += 1
 
-        sigs = detect_signals(name, df, atr_val)
+        strict = name in STRICT_INSTRUMENTS
+        rmult = STRICT_RAPID_ATR_MULT if strict else None
+        sigs = detect_signals(name, df, atr_val, rapid_mult=rmult)
         if not sigs:
             continue
 
-        # filter vyssieho timeframe
+        # filter vyssieho timeframe + denna trendova brana
         sigs, trend = apply_htf_filter(ticker, sigs)
         if not sigs:
             continue
@@ -1298,6 +1356,12 @@ def scan_once(state):
         conf_dir, conf_n = confluence_tag(sigs)
         if CONFLUENCE_ONLY and conf_dir is None:
             continue
+
+        # sprisneny trh (napr. NatGas): posli LEN pri zhode 2+ signalov
+        if strict and STRICT_NEED_CONFLUENCE and conf_dir is None:
+            continue
+        if strict and conf_dir is not None:
+            sigs = [s for s in sigs if s["dir"] == conf_dir]
 
         # dedup napric behmi
         fresh = []
